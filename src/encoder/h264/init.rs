@@ -387,7 +387,8 @@ impl H264Encoder {
 
         let vui = ash::vk::native::StdVideoH264SequenceParameterSetVui {
             flags: vui_flags,
-            aspect_ratio_idc: ash::vk::native::StdVideoH264AspectRatioIdc_STD_VIDEO_H264_ASPECT_RATIO_IDC_SQUARE,
+            aspect_ratio_idc:
+                ash::vk::native::StdVideoH264AspectRatioIdc_STD_VIDEO_H264_ASPECT_RATIO_IDC_SQUARE,
             sar_width: 0,
             sar_height: 0,
             video_format: 5,
@@ -403,7 +404,6 @@ impl H264Encoder {
             reserved1: 0,
             pHrdParameters: &hrd_params,
         };
-
 
         let sps = ash::vk::native::StdVideoH264SequenceParameterSet {
             flags: sps_flags,

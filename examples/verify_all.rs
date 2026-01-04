@@ -121,7 +121,8 @@ fn run_test(
             Err(e) => return Err(format!("Failed to create encoder: {}", e).into()),
         };
 
-        let mut input_image = InputImage::new(context.clone(), codec, WIDTH, HEIGHT, depth, format)?;
+        let mut input_image =
+            InputImage::new(context.clone(), codec, WIDTH, HEIGHT, depth, format)?;
 
         let input_path = match format {
             PixelFormat::Yuv420 => "testdata/test_frames_yuv420p.yuv",

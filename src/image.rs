@@ -64,10 +64,11 @@ impl InputImage {
         };
 
         // Create video profile info for the image creation.
-        let mut h264_profile = vk::VideoEncodeH264ProfileInfoKHR::default()
-            .std_profile_idc(h264_profile_idc);
-        let mut h265_profile = vk::VideoEncodeH265ProfileInfoKHR::default()
-            .std_profile_idc(ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN);
+        let mut h264_profile =
+            vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(h264_profile_idc);
+        let mut h265_profile = vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(
+            ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
+        );
 
         let mut profile_info = vk::VideoProfileInfoKHR::default()
             .chroma_subsampling(pixel_format.into())
@@ -85,11 +86,15 @@ impl InputImage {
                     .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265);
                 profile_info.p_next = &mut h265_profile as *mut _ as *mut std::ffi::c_void;
             }
-            _ => return Err(PixelForgeError::InvalidInput("Unsupported codec".to_string())),
+            _ => {
+                return Err(PixelForgeError::InvalidInput(
+                    "Unsupported codec".to_string(),
+                ))
+            }
         }
 
-        let mut profile_list = vk::VideoProfileListInfoKHR::default()
-            .profiles(std::slice::from_ref(&profile_info));
+        let mut profile_list =
+            vk::VideoProfileListInfoKHR::default().profiles(std::slice::from_ref(&profile_info));
 
         // Select format based on pixel format and bit depth.
         // Use 2-plane semi-planar formats for both YUV420 and YUV444.
