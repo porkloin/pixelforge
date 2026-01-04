@@ -1,0 +1,151 @@
+//! # PixelForge
+//!
+//! A Vulkan-based video encoding library for Rust, supporting H.264 and H.265 codecs.
+//!
+//! > ⚠️ **Disclaimer**: This library was developed using AI ("vibe-coding") - partly to
+//! > see if it could be done, partly because I have practically zero experience with Vulkan.
+//! > While the code has been tested and works in my usecase, it may not work in all cases
+//! > and it may not follow best practices. Contributions and improvements are very welcome!
+//!
+//! ## Features
+//!
+//! - **Hardware-accelerated** video encoding using Vulkan Video extensions.
+//! - **Multiple codec support**: H.264/AVC, H.265/HEVC.
+//! - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
+//! - **Flexible configuration**: Rate control (CBR, VBR, CQP), quality levels, GOP settings.
+//! - **Utility helpers**: [`InputImage`] for easy YUV data upload to GPU.
+//! - **Optional DMA-BUF support**: Zero-copy image import from external processes (Linux only).
+//!
+//! > **Note**: B-frame support is not yet implemented. Setting `b_frame_count > 0` will panic.
+//!
+//! ## Supported Codecs
+//!
+//! | Codec | Encode |
+//! |-------|--------|
+//! | H.264/AVC | ✓ |
+//! | H.265/HEVC | ✓ |
+//!
+//! ## Requirements
+//!
+//! - A GPU with Vulkan video encoding support (e.g., NVIDIA RTX series, AMD RDNA2+, Intel Arc)
+//!
+//! ## Installation
+//!
+//! Add this to your `Cargo.toml`:
+//!
+//! ```toml
+//! [dependencies]
+//! pixelforge = "0.1"
+//! ```
+//!
+//! ### Optional Features
+//!
+//! | Feature | Description |
+//! |---------|-------------|
+//! | `dmabuf` | Enable DMA-BUF support for zero-copy image import from external processes (Linux only). Adds Vulkan extensions: `VK_KHR_external_memory`, `VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier`. |
+//!
+//! To enable DMA-BUF support:
+//!
+//! ```toml
+//! [dependencies]
+//! pixelforge = { version = "0.1", features = ["dmabuf"] }
+//! ```
+//!
+//! ## Quick Start
+//!
+//! ### Query Capabilities
+//!
+//! ```rust,no_run
+//! use pixelforge::{Codec, VideoContextBuilder};
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let context = VideoContextBuilder::new()
+//!         .app_name("My App")
+//!         .build()?;
+//!
+//!     for codec in [Codec::H264, Codec::H265] {
+//!         println!("{:?}: encode={}",
+//!             codec,
+//!             context.supports_encode(codec)
+//!         );
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Encoding Video
+//!
+//! ```rust,no_run
+//! use pixelforge::{
+//!     Codec, EncodeBitDepth, EncodeConfig, Encoder, InputImage, PixelFormat, RateControlMode,
+//!     VideoContextBuilder,
+//! };
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let context = VideoContextBuilder::new()
+//!         .app_name("Encoder Example")
+//!         .require_encode(Codec::H264)
+//!         .build()?;
+//!
+//!     let config = EncodeConfig::h264(1920, 1080)
+//!         .with_rate_control(RateControlMode::Vbr)
+//!         .with_target_bitrate(5_000_000)
+//!         .with_frame_rate(30, 1)
+//!         .with_gop_size(60);
+//!
+//!     // Create an InputImage helper for uploading YUV data to the GPU.
+//!     let mut input_image = InputImage::new(
+//!         context.clone(),
+//!         1920,
+//!         1080,
+//!         EncodeBitDepth::Eight,
+//!         PixelFormat::Yuv420,
+//!     )?;
+//!     let mut encoder = Encoder::new(context, config)?;
+//!
+//!     // For each frame: upload YUV data and encode.
+//!     // let yuv_data: &[u8] = ...;  // YUV420 frame data
+//!     // input_image.upload_yuv420(yuv_data)?;
+//!     // let packets = encoder.encode(input_image.image())?;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Examples
+//!
+//! Run the examples with:
+//!
+//! ```text
+//! # Query codec capabilities
+//! cargo run --example query_capabilities
+//!
+//! # H.264 encoding example
+//! cargo run --example encode_h264
+//!
+//! # H.265 encoding example
+//! cargo run --example encode_h265
+//! ```
+//!
+//! ## Contributing
+//!
+//! Contributions are welcome! Please feel free to submit a Pull Request.
+
+pub mod converter;
+pub mod encoder;
+pub mod error;
+pub mod image;
+pub mod vulkan;
+
+pub use converter::{ColorConverter, ColorConverterConfig, InputFormat, OutputFormat};
+pub use encoder::{
+    BitDepth as EncodeBitDepth, Codec, EncodeConfig, EncodedPacket, Encoder, FrameType,
+    PixelFormat, RateControlMode, DEFAULT_FRAME_RATE, DEFAULT_GOP_SIZE, DEFAULT_H264_QP,
+    DEFAULT_H265_QP, DEFAULT_MAX_BITRATE, DEFAULT_MAX_REFERENCE_FRAMES, DEFAULT_TARGET_BITRATE,
+};
+pub use error::PixelForgeError;
+pub use image::InputImage;
+pub use vulkan::VideoContextBuilder;
+
+/// Re-export VideoContext for convenience.
+pub use vulkan::VideoContext;

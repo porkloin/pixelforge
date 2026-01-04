@@ -1,0 +1,763 @@
+//! H.265/HEVC encoder internal encoding implementation.
+//!
+//! This module handles the actual frame encoding using Vulkan Video.
+
+use super::{H265Encoder, MIN_BITSTREAM_BUFFER_SIZE};
+
+use crate::encoder::gop::{GopFrameType, GopPosition};
+use crate::error::{PixelForgeError, Result};
+use ash::vk;
+use tracing::debug;
+
+impl H265Encoder {
+    /// Encode a frame that has already been uploaded to the input image.
+    ///
+    /// This function:
+    /// 1. Records the video encode command buffer
+    /// 2. Sets up reference picture information
+    /// 3. Executes the encode operation
+    /// 4. Returns the encoded bitstream data
+    pub(super) fn encode_frame_internal(
+        &mut self,
+        gop_position: &GopPosition,
+        pic_order_cnt: i32,
+        is_idr: bool,
+    ) -> Result<Vec<u8>> {
+        // Reset command buffer.
+        unsafe {
+            self.context.device().reset_command_buffer(
+                self.encode_command_buffer,
+                vk::CommandBufferResetFlags::empty(),
+            )
+        }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+        // Begin command buffer.
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe {
+            self.context
+                .device()
+                .begin_command_buffer(self.encode_command_buffer, &begin_info)
+        }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+        // Reset query pool before beginning queries (required by validation layers)
+        unsafe {
+            self.context.device().cmd_reset_query_pool(
+                self.encode_command_buffer,
+                self.query_pool,
+                0,
+                1,
+            );
+        }
+
+        // Transition DPB image to video encode DPB layout.
+        // Always transition from UNDEFINED for simplicity and consistency with H264 encoder.
+        let dpb_barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(self.dpb_images[self.current_dpb_slot as usize])
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::empty());
+
+        unsafe {
+            self.context.device().cmd_pipeline_barrier(
+                self.encode_command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[dpb_barrier],
+            );
+        }
+
+        // Determine picture type.
+        let is_b_frame = gop_position.frame_type == GopFrameType::B;
+        let is_reference = gop_position.is_reference;
+        let slice_type = if is_idr {
+            ash::vk::native::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I
+        } else if is_b_frame {
+            ash::vk::native::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_B
+        } else {
+            ash::vk::native::StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P
+        };
+
+        let picture_type = if is_idr {
+            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
+        } else if is_b_frame {
+            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_B
+        } else {
+            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
+        };
+
+        // Build StdVideoEncodeH265SliceSegmentHeader.
+        let slice_header_flags = ash::vk::native::StdVideoEncodeH265SliceSegmentHeaderFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: ash::vk::native::StdVideoEncodeH265SliceSegmentHeaderFlags::new_bitfield_1(
+                1, // first_slice_segment_in_pic_flag
+                0, // dependent_slice_segment_flag
+                1, // slice_sao_luma_flag
+                1, // slice_sao_chroma_flag
+                0, // num_ref_idx_active_override_flag
+                0, // mvd_l1_zero_flag
+                0, // cabac_init_flag
+                0, // cu_chroma_qp_offset_enabled_flag
+                0, // deblocking_filter_override_flag
+                0, // slice_deblocking_filter_disabled_flag
+                0, // collocated_from_l0_flag
+                0, // slice_loop_filter_across_slices_enabled_flag
+                0, // reserved
+            ),
+        };
+
+        let slice_header = ash::vk::native::StdVideoEncodeH265SliceSegmentHeader {
+            flags: slice_header_flags,
+            slice_type,
+            slice_segment_address: 0,
+            collocated_ref_idx: 0,
+            MaxNumMergeCand: 5,
+            slice_cb_qp_offset: 0,
+            slice_cr_qp_offset: 0,
+            slice_beta_offset_div2: 0,
+            slice_tc_offset_div2: 0,
+            slice_act_y_qp_offset: 0,
+            slice_act_cb_qp_offset: 0,
+            slice_act_cr_qp_offset: 0,
+            slice_qp_delta: 0,
+            reserved1: 0,
+            pWeightTable: std::ptr::null(),
+        };
+
+        // Build short-term reference picture set.
+        // For B-frames, we need both negative (past) and positive (future) references.
+        // For P-frames, we only need negative references.
+        let mut delta_poc_s0_minus1 = [0u16; 16]; // negative refs (past)
+        let mut delta_poc_s1_minus1 = [0u16; 16]; // positive refs (future)
+        let mut num_negative_pics: u8 = 0;
+        let mut num_positive_pics: u8 = 0;
+        let mut used_by_curr_pic_s0_flag: u16 = 0;
+        let mut used_by_curr_pic_s1_flag: u16 = 0;
+
+        if !is_idr && self.has_reference {
+            // L0 reference (negative/past)
+            let delta_poc_l0 = self.reference_poc - pic_order_cnt;
+            delta_poc_s0_minus1[0] = (-delta_poc_l0 - 1).max(0) as u16;
+            num_negative_pics = 1;
+            used_by_curr_pic_s0_flag = 1; // First negative reference is used
+
+            debug!(
+                "H265 RPS: POC={}, L0 ref_poc={}, delta_poc_l0={}",
+                pic_order_cnt, self.reference_poc, delta_poc_l0
+            );
+
+            // For B-frames, add L1 reference (positive/future)
+            if is_b_frame && self.has_backward_reference {
+                let delta_poc_l1 = self.backward_reference_poc - pic_order_cnt;
+                // delta_poc_s1 should be positive
+                delta_poc_s1_minus1[0] = (delta_poc_l1 - 1).max(0) as u16;
+                num_positive_pics = 1;
+                used_by_curr_pic_s1_flag = 1; // First positive reference is used
+
+                debug!(
+                    "H265 RPS: L1 backward_ref_poc={}, delta_poc_l1={}",
+                    self.backward_reference_poc, delta_poc_l1
+                );
+            }
+        }
+
+        let rps_flags = ash::vk::native::StdVideoH265ShortTermRefPicSetFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: ash::vk::native::StdVideoH265ShortTermRefPicSetFlags::new_bitfield_1(0, 0),
+            __bindgen_padding_0: [0; 3],
+        };
+
+        let frame_rps = ash::vk::native::StdVideoH265ShortTermRefPicSet {
+            flags: rps_flags,
+            delta_idx_minus1: 0,
+            use_delta_flag: 0,
+            abs_delta_rps_minus1: 0,
+            used_by_curr_pic_flag: 0,
+            used_by_curr_pic_s0_flag,
+            used_by_curr_pic_s1_flag,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            num_negative_pics,
+            num_positive_pics,
+            delta_poc_s0_minus1,
+            delta_poc_s1_minus1,
+        };
+
+        // Empty RPS for IDR frames.
+        let empty_rps_flags = ash::vk::native::StdVideoH265ShortTermRefPicSetFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: ash::vk::native::StdVideoH265ShortTermRefPicSetFlags::new_bitfield_1(0, 0),
+            __bindgen_padding_0: [0; 3],
+        };
+
+        let empty_rps = ash::vk::native::StdVideoH265ShortTermRefPicSet {
+            flags: empty_rps_flags,
+            delta_idx_minus1: 0,
+            use_delta_flag: 0,
+            abs_delta_rps_minus1: 0,
+            used_by_curr_pic_flag: 0,
+            used_by_curr_pic_s0_flag: 0,
+            used_by_curr_pic_s1_flag: 0,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            num_negative_pics: 0,
+            num_positive_pics: 0,
+            delta_poc_s0_minus1: [0; 16],
+            delta_poc_s1_minus1: [0; 16],
+        };
+
+        // Build picture info flags.
+        let picture_info_flags = ash::vk::native::StdVideoEncodeH265PictureInfoFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: ash::vk::native::StdVideoEncodeH265PictureInfoFlags::new_bitfield_1(
+                if is_reference { 1 } else { 0 }, // is_reference
+                if is_idr { 1 } else { 0 },       // IrapPicFlag
+                0,                                // used_for_long_term_reference
+                0,                                // discardable_flag
+                0,                                // cross_layer_bla_flag
+                1,                                // pic_output_flag
+                if is_idr { 1 } else { 0 },       // no_output_of_prior_pics_flag
+                0,                                // short_term_ref_pic_set_sps_flag
+                0,                                // slice_temporal_mvp_enabled_flag
+                0,                                // reserved
+            ),
+        };
+
+        // Set up reference lists.
+        const NO_REFERENCE_PICTURE: u8 = 0xFF;
+        let mut ref_list0: [u8; 15] = [NO_REFERENCE_PICTURE; 15];
+        let mut ref_list1: [u8; 15] = [NO_REFERENCE_PICTURE; 15];
+
+        let (num_ref_l0, num_ref_l1) =
+            if is_b_frame && self.has_reference && self.has_backward_reference {
+                ref_list0[0] = self.reference_dpb_slot;
+                ref_list1[0] = self.backward_reference_dpb_slot;
+                (1, 1)
+            } else if !is_idr && self.has_reference {
+                ref_list0[0] = self.reference_dpb_slot;
+                (1, 0)
+            } else {
+                (0, 0)
+            };
+
+        let ref_lists_info_flags = ash::vk::native::StdVideoEncodeH265ReferenceListsInfoFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: ash::vk::native::StdVideoEncodeH265ReferenceListsInfoFlags::new_bitfield_1(
+                0, 0, 0,
+            ),
+        };
+
+        let ref_lists_info = ash::vk::native::StdVideoEncodeH265ReferenceListsInfo {
+            flags: ref_lists_info_flags,
+            num_ref_idx_l0_active_minus1: if num_ref_l0 > 0 {
+                (num_ref_l0 - 1) as u8
+            } else {
+                0
+            },
+            num_ref_idx_l1_active_minus1: if num_ref_l1 > 0 {
+                (num_ref_l1 - 1) as u8
+            } else {
+                0
+            },
+            RefPicList0: ref_list0,
+            RefPicList1: ref_list1,
+            list_entry_l0: [0; 15],
+            list_entry_l1: [0; 15],
+        };
+
+        let picture_info = ash::vk::native::StdVideoEncodeH265PictureInfo {
+            flags: picture_info_flags,
+            pps_pic_parameter_set_id: 0,
+            pps_seq_parameter_set_id: 0,
+            sps_video_parameter_set_id: 0,
+            PicOrderCntVal: pic_order_cnt,
+            TemporalId: 0,
+            reserved1: [0; 7],
+            pRefLists: if !is_idr && self.has_reference {
+                &ref_lists_info
+            } else {
+                std::ptr::null()
+            },
+            pShortTermRefPicSet: if is_idr {
+                &empty_rps
+            } else if self.has_reference {
+                &frame_rps
+            } else {
+                &empty_rps
+            },
+            pLongTermRefPics: std::ptr::null(),
+            pic_type: picture_type,
+            short_term_ref_pic_set_idx: 0,
+        };
+
+        // Create slice NAL unit entry.
+        let constant_qp = match self.config.rate_control_mode {
+            crate::encoder::RateControlMode::Cqp | crate::encoder::RateControlMode::Disabled => {
+                self.config.quality_level as i32
+            }
+            _ => 0,
+        };
+        let nalu_slice_entries = [vk::VideoEncodeH265NaluSliceSegmentInfoKHR::default()
+            .constant_qp(constant_qp)
+            .std_slice_segment_header(&slice_header)];
+
+        // Create H.265 picture info.
+        let mut h265_picture_info = vk::VideoEncodeH265PictureInfoKHR::default()
+            .nalu_slice_segment_entries(&nalu_slice_entries)
+            .std_picture_info(&picture_info);
+
+        // Set up source picture resource.
+        let src_picture_resource = vk::VideoPictureResourceInfoKHR::default()
+            .coded_offset(vk::Offset2D { x: 0, y: 0 })
+            .coded_extent(vk::Extent2D {
+                width: self.aligned_width,
+                height: self.aligned_height,
+            })
+            .base_array_layer(0)
+            .image_view_binding(self.input_image_view);
+
+        // Set up setup picture resource (reconstructed picture)
+        let setup_picture_resource = vk::VideoPictureResourceInfoKHR::default()
+            .coded_offset(vk::Offset2D { x: 0, y: 0 })
+            .coded_extent(vk::Extent2D {
+                width: self.aligned_width,
+                height: self.aligned_height,
+            })
+            .base_array_layer(0)
+            .image_view_binding(self.dpb_image_views[self.current_dpb_slot as usize]);
+
+        // Create reference info for setup slot.
+        let std_reference_info_flags = ash::vk::native::StdVideoEncodeH265ReferenceInfoFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: ash::vk::native::StdVideoEncodeH265ReferenceInfoFlags::new_bitfield_1(
+                0, 0, 0,
+            ),
+        };
+
+        let std_reference_info = ash::vk::native::StdVideoEncodeH265ReferenceInfo {
+            flags: std_reference_info_flags,
+            PicOrderCntVal: pic_order_cnt,
+            TemporalId: 0,
+            pic_type: picture_type,
+        };
+
+        let mut h265_setup_dpb_slot_info =
+            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&std_reference_info);
+
+        let mut setup_slot_info = vk::VideoReferenceSlotInfoKHR::default()
+            .slot_index(self.current_dpb_slot as i32)
+            .picture_resource(&setup_picture_resource);
+        setup_slot_info.p_next =
+            (&mut h265_setup_dpb_slot_info as *mut vk::VideoEncodeH265DpbSlotInfoKHR).cast();
+
+        // Setup slot for begin - always use -1 to indicate it's not yet active.
+        // (it will be written to during encoding)
+        let mut h265_begin_dpb_slot_info =
+            vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&std_reference_info);
+
+        let mut setup_slot_for_begin = vk::VideoReferenceSlotInfoKHR::default()
+            .slot_index(-1) // Always -1 for setup slot
+            .picture_resource(&setup_picture_resource);
+        setup_slot_for_begin.p_next =
+            (&mut h265_begin_dpb_slot_info as *mut vk::VideoEncodeH265DpbSlotInfoKHR).cast();
+
+        // Set up reference slots.
+        let mut ref_slot_l0: vk::VideoReferenceSlotInfoKHR;
+        let mut ref_slot_l1: vk::VideoReferenceSlotInfoKHR;
+        let ref_resource_l0: vk::VideoPictureResourceInfoKHR;
+        let ref_resource_l1: vk::VideoPictureResourceInfoKHR;
+        let mut std_ref_l0_info: ash::vk::native::StdVideoEncodeH265ReferenceInfo;
+        let mut std_ref_l1_info: ash::vk::native::StdVideoEncodeH265ReferenceInfo;
+        let mut h265_ref_l0_dpb_slot_info: vk::VideoEncodeH265DpbSlotInfoKHR;
+        let mut h265_ref_l1_dpb_slot_info: vk::VideoEncodeH265DpbSlotInfoKHR;
+
+        let reference_slots_0: [vk::VideoReferenceSlotInfoKHR; 0];
+        let reference_slots_1: [vk::VideoReferenceSlotInfoKHR; 1];
+        let reference_slots_2: [vk::VideoReferenceSlotInfoKHR; 2];
+        let begin_slots_1: [vk::VideoReferenceSlotInfoKHR; 1];
+        let begin_slots_2: [vk::VideoReferenceSlotInfoKHR; 2];
+        let begin_slots_3: [vk::VideoReferenceSlotInfoKHR; 3];
+
+        let has_l0_ref = !is_idr && self.has_reference;
+        let has_l1_ref = is_b_frame && self.has_backward_reference;
+
+        let (reference_slots, reference_slots_for_begin): (
+            &[vk::VideoReferenceSlotInfoKHR],
+            &[vk::VideoReferenceSlotInfoKHR],
+        ) = if has_l0_ref && has_l1_ref {
+            // B-frame with both L0 and L1 references.
+            ref_resource_l0 = vk::VideoPictureResourceInfoKHR::default()
+                .coded_offset(vk::Offset2D { x: 0, y: 0 })
+                .coded_extent(vk::Extent2D {
+                    width: self.aligned_width,
+                    height: self.aligned_height,
+                })
+                .base_array_layer(0)
+                .image_view_binding(self.dpb_image_views[self.reference_dpb_slot as usize]);
+
+            std_ref_l0_info = std_reference_info;
+            std_ref_l0_info.PicOrderCntVal = self.reference_poc;
+            std_ref_l0_info.pic_type = self.reference_pic_type;
+            h265_ref_l0_dpb_slot_info =
+                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&std_ref_l0_info);
+            ref_slot_l0 = vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(self.reference_dpb_slot as i32)
+                .picture_resource(&ref_resource_l0);
+            ref_slot_l0.p_next =
+                (&mut h265_ref_l0_dpb_slot_info as *mut vk::VideoEncodeH265DpbSlotInfoKHR).cast();
+
+            ref_resource_l1 = vk::VideoPictureResourceInfoKHR::default()
+                .coded_offset(vk::Offset2D { x: 0, y: 0 })
+                .coded_extent(vk::Extent2D {
+                    width: self.aligned_width,
+                    height: self.aligned_height,
+                })
+                .base_array_layer(0)
+                .image_view_binding(
+                    self.dpb_image_views[self.backward_reference_dpb_slot as usize],
+                );
+
+            std_ref_l1_info = std_reference_info;
+            std_ref_l1_info.PicOrderCntVal = self.backward_reference_poc;
+            std_ref_l1_info.pic_type =
+                ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P;
+            h265_ref_l1_dpb_slot_info =
+                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&std_ref_l1_info);
+            ref_slot_l1 = vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(self.backward_reference_dpb_slot as i32)
+                .picture_resource(&ref_resource_l1);
+            ref_slot_l1.p_next =
+                (&mut h265_ref_l1_dpb_slot_info as *mut vk::VideoEncodeH265DpbSlotInfoKHR).cast();
+
+            reference_slots_2 = [ref_slot_l0, ref_slot_l1];
+            begin_slots_3 = [setup_slot_for_begin, ref_slot_l0, ref_slot_l1];
+            (&reference_slots_2, &begin_slots_3)
+        } else if has_l0_ref {
+            // P-frame with only L0 reference.
+            ref_resource_l0 = vk::VideoPictureResourceInfoKHR::default()
+                .coded_offset(vk::Offset2D { x: 0, y: 0 })
+                .coded_extent(vk::Extent2D {
+                    width: self.aligned_width,
+                    height: self.aligned_height,
+                })
+                .base_array_layer(0)
+                .image_view_binding(self.dpb_image_views[self.reference_dpb_slot as usize]);
+
+            std_ref_l0_info = std_reference_info;
+            std_ref_l0_info.PicOrderCntVal = self.reference_poc;
+            std_ref_l0_info.pic_type = self.reference_pic_type;
+            h265_ref_l0_dpb_slot_info =
+                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&std_ref_l0_info);
+            ref_slot_l0 = vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(self.reference_dpb_slot as i32)
+                .picture_resource(&ref_resource_l0);
+            ref_slot_l0.p_next =
+                (&mut h265_ref_l0_dpb_slot_info as *mut vk::VideoEncodeH265DpbSlotInfoKHR).cast();
+
+            reference_slots_1 = [ref_slot_l0];
+            begin_slots_2 = [setup_slot_for_begin, ref_slot_l0];
+            (&reference_slots_1, &begin_slots_2)
+        } else {
+            // I/IDR frame with no references.
+            reference_slots_0 = [];
+            begin_slots_1 = [setup_slot_for_begin];
+            (&reference_slots_0, &begin_slots_1)
+        };
+
+        // Rate control setup.
+        let (rc_mode, average_bitrate, max_bitrate, qp) = match self.config.rate_control_mode {
+            crate::encoder::RateControlMode::Cqp | crate::encoder::RateControlMode::Disabled => (
+                vk::VideoEncodeRateControlModeFlagsKHR::DISABLED,
+                0,
+                0,
+                self.config.quality_level as i32,
+            ),
+            crate::encoder::RateControlMode::Cbr => (
+                vk::VideoEncodeRateControlModeFlagsKHR::CBR,
+                self.config.target_bitrate,
+                self.config.target_bitrate,
+                26,
+            ),
+            crate::encoder::RateControlMode::Vbr => (
+                vk::VideoEncodeRateControlModeFlagsKHR::VBR,
+                self.config.target_bitrate,
+                self.config.max_bitrate,
+                26,
+            ),
+        };
+
+        let min_qp_val = if rc_mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
+            qp
+        } else {
+            26
+        };
+        let max_qp_val = if rc_mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
+            qp
+        } else {
+            51
+        };
+
+        let min_qp = vk::VideoEncodeH265QpKHR {
+            qp_i: min_qp_val,
+            qp_p: min_qp_val,
+            qp_b: min_qp_val,
+        };
+
+        let max_qp = vk::VideoEncodeH265QpKHR {
+            qp_i: max_qp_val,
+            qp_p: max_qp_val,
+            qp_b: max_qp_val,
+        };
+
+        let mut h265_rc_layer_info = vk::VideoEncodeH265RateControlLayerInfoKHR::default()
+            .min_qp(min_qp)
+            .max_qp(max_qp);
+
+        let mut rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
+            .average_bitrate(average_bitrate as u64)
+            .max_bitrate(max_bitrate as u64)
+            .frame_rate_numerator(self.config.frame_rate_numerator)
+            .frame_rate_denominator(self.config.frame_rate_denominator);
+        rc_layer_info.p_next =
+            (&mut h265_rc_layer_info as *mut vk::VideoEncodeH265RateControlLayerInfoKHR).cast();
+
+        let rc_layers = [rc_layer_info];
+
+        let mut h265_rc_info = vk::VideoEncodeH265RateControlInfoKHR::default()
+            .gop_frame_count(self.config.gop_size)
+            .idr_period(self.config.gop_size)
+            .consecutive_b_frame_count(self.config.b_frame_count);
+
+        let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc_mode);
+
+        if rc_mode != vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
+            rc_info = rc_info
+                .layers(&rc_layers)
+                .virtual_buffer_size_in_ms(1000)
+                .initial_virtual_buffer_size_in_ms(1000);
+            rc_info.p_next =
+                (&mut h265_rc_info as *mut vk::VideoEncodeH265RateControlInfoKHR).cast();
+        }
+
+        // Begin video coding.
+        let is_first_frame = self.encode_frame_num == 0;
+
+        let begin_coding_info = if is_first_frame {
+            vk::VideoBeginCodingInfoKHR::default()
+                .video_session(self.session)
+                .video_session_parameters(self.session_params)
+                .reference_slots(reference_slots_for_begin)
+        } else {
+            let mut info = vk::VideoBeginCodingInfoKHR::default()
+                .video_session(self.session)
+                .video_session_parameters(self.session_params)
+                .reference_slots(reference_slots_for_begin);
+            info.p_next = (&mut rc_info as *mut vk::VideoEncodeRateControlInfoKHR).cast();
+            info
+        };
+
+        unsafe {
+            (self.video_queue_fn.fp().cmd_begin_video_coding_khr)(
+                self.encode_command_buffer,
+                &begin_coding_info,
+            );
+        }
+
+        // Reset video coding state for the first frame.
+        if is_first_frame {
+            let reset_control_info = vk::VideoCodingControlInfoKHR::default()
+                .flags(vk::VideoCodingControlFlagsKHR::RESET);
+            unsafe {
+                (self.video_queue_fn.fp().cmd_control_video_coding_khr)(
+                    self.encode_command_buffer,
+                    &reset_control_info,
+                );
+            }
+
+            // Set rate control after reset.
+            let mut rate_control = vk::VideoCodingControlInfoKHR::default()
+                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
+            rate_control.p_next = (&mut rc_info as *mut vk::VideoEncodeRateControlInfoKHR).cast();
+            unsafe {
+                (self.video_queue_fn.fp().cmd_control_video_coding_khr)(
+                    self.encode_command_buffer,
+                    &rate_control,
+                );
+            }
+        }
+
+        // Encode command.
+        let mut encode_info = vk::VideoEncodeInfoKHR::default()
+            .flags(vk::VideoEncodeFlagsKHR::empty())
+            .src_picture_resource(src_picture_resource)
+            .setup_reference_slot(&setup_slot_info)
+            .reference_slots(reference_slots)
+            .dst_buffer(self.bitstream_buffer)
+            .dst_buffer_offset(0)
+            .dst_buffer_range(MIN_BITSTREAM_BUFFER_SIZE as u64);
+        encode_info.p_next =
+            (&mut h265_picture_info as *mut vk::VideoEncodeH265PictureInfoKHR).cast();
+
+        unsafe {
+            self.context.device().cmd_begin_query(
+                self.encode_command_buffer,
+                self.query_pool,
+                0,
+                vk::QueryControlFlags::empty(),
+            );
+
+            (self.video_encode_fn.fp().cmd_encode_video_khr)(
+                self.encode_command_buffer,
+                &encode_info,
+            );
+
+            self.context
+                .device()
+                .cmd_end_query(self.encode_command_buffer, self.query_pool, 0);
+        }
+
+        // Add DPB synchronization barrier after encoding.
+        {
+            let dpb_sync_barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+                .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.dpb_images[self.current_dpb_slot as usize])
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ);
+
+            unsafe {
+                self.context.device().cmd_pipeline_barrier(
+                    self.encode_command_buffer,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[dpb_sync_barrier],
+                );
+            }
+        }
+
+        // End video coding.
+        let end_coding_info = vk::VideoEndCodingInfoKHR::default();
+        unsafe {
+            (self.video_queue_fn.fp().cmd_end_video_coding_khr)(
+                self.encode_command_buffer,
+                &end_coding_info,
+            );
+        }
+
+        // End command buffer.
+        unsafe {
+            self.context
+                .device()
+                .end_command_buffer(self.encode_command_buffer)
+        }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+        // Submit encode command.
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&self.encode_command_buffer));
+
+        let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
+            PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
+        })?;
+
+        debug!(
+            "Submitting frame {} to GPU: idr={}, has_ref={}, ref_slot={}, cur_slot={}",
+            self.encode_frame_num,
+            is_idr,
+            self.has_reference,
+            self.reference_dpb_slot,
+            self.current_dpb_slot
+        );
+
+        unsafe {
+            self.context
+                .device()
+                .queue_submit(encode_queue, &[submit_info], self.encode_fence)
+        }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+        // Wait for completion.
+        unsafe {
+            self.context
+                .device()
+                .wait_for_fences(&[self.encode_fence], true, u64::MAX)
+        }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+        unsafe { self.context.device().reset_fences(&[self.encode_fence]) }
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+        // Get query results.
+        #[repr(C)]
+        struct VideoEncodeFeedbackResult {
+            offset: u32,
+            bytes_written: u32,
+        }
+        let mut query_results = [VideoEncodeFeedbackResult {
+            offset: 0,
+            bytes_written: 0,
+        }];
+        unsafe {
+            self.context.device().get_query_pool_results(
+                self.query_pool,
+                0,
+                &mut query_results,
+                vk::QueryResultFlags::WAIT,
+            )
+        }
+        .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
+
+        let offset = query_results[0].offset as usize;
+        let size = query_results[0].bytes_written as usize;
+
+        if size == 0 {
+            return Err(PixelForgeError::QueryPool(
+                "Encoder produced 0 bytes".to_string(),
+            ));
+        }
+
+        debug!("Encoded frame: offset={}, size={}", offset, size);
+
+        // Mark DPB slot as active.
+        self.dpb_slot_active[self.current_dpb_slot as usize] = true;
+
+        // Copy data from bitstream buffer.
+        let mut encoded_data = vec![0u8; size];
+        unsafe {
+            let src = std::slice::from_raw_parts(self.bitstream_buffer_ptr.add(offset), size);
+            encoded_data.copy_from_slice(src);
+        }
+
+        Ok(encoded_data)
+    }
+}

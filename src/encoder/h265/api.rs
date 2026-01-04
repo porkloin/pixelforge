@@ -1,0 +1,250 @@
+use super::H265Encoder;
+
+use crate::encoder::dpb::{DecodedPictureBufferTrait, DpbConfig, PictureStartInfo, PictureType};
+use crate::encoder::gop::{GopFrameType, GopPosition};
+use crate::encoder::EncodedPacket;
+use crate::error::Result;
+use crate::PixelForgeError;
+use ash::vk;
+use tracing::debug;
+
+impl H265Encoder {
+    /// Get the internal input image.
+    ///
+    /// This image can be used as a target for `ColorConverter::convert` to avoid
+    /// an intermediate copy.
+    pub fn input_image(&self) -> vk::Image {
+        self.input_image
+    }
+
+    /// Encode a frame from a GPU image.
+    ///
+    /// This accepts a source NV12 image on the GPU and encodes it directly without.
+    /// any CPU-side data copies. The source image must be in NV12 format with the
+    /// same dimensions as the encoder configuration, and should be in GENERAL layout.
+    ///
+    /// # Panics
+    ///
+    /// The encoder will panic at creation time if B-frames are enabled (b_frame_count > 0),
+    /// as B-frame encoding is not yet supported.
+    pub fn encode(&mut self, src_image: vk::Image) -> Result<Vec<EncodedPacket>> {
+        let gop_position = self.gop.get_next_frame();
+        let display_order = self.input_frame_num;
+        self.input_frame_num += 1;
+
+        debug!(
+            "Encoding frame {} from GPU image: type={:?}, poc={}",
+            display_order, gop_position.frame_type, gop_position.pic_order_cnt
+        );
+
+        // Upload from GPU image.
+        self.upload_from_image(src_image)?;
+
+        // Encode immediately.
+        let packet = self.encode_current_frame(&gop_position, display_order)?;
+
+        Ok(vec![packet])
+    }
+
+    /// Internal method to encode the current frame already uploaded to input_image.
+    fn encode_current_frame(
+        &mut self,
+        gop_position: &GopPosition,
+        display_order: u64,
+    ) -> Result<EncodedPacket> {
+        let is_idr = gop_position.frame_type.is_idr();
+        let is_reference = gop_position.is_reference;
+        let is_b_frame = gop_position.frame_type == GopFrameType::B;
+        let frame_type = match gop_position.frame_type {
+            GopFrameType::Idr | GopFrameType::I => crate::encoder::FrameType::I,
+            GopFrameType::P => crate::encoder::FrameType::P,
+            GopFrameType::B => crate::encoder::FrameType::B,
+        };
+
+        // Compute picture type for reference info.
+        let picture_type = if is_idr {
+            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
+        } else if is_b_frame {
+            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_B
+        } else {
+            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
+        };
+
+        debug!(
+            "Encoding frame: display_order={}, type={:?}, idr={}, ref={}",
+            display_order, frame_type, is_idr, is_reference
+        );
+
+        if is_idr {
+            // Reset DPB by calling sequence_start with new config for IDR.
+            let dpb_config = DpbConfig {
+                dpb_size: self.dpb_slot_count as u32,
+                max_num_ref_frames: self.config.max_reference_frames,
+                use_multiple_references: self.config.b_frame_count > 0,
+                log2_max_frame_num_minus4: 0,
+                log2_max_pic_order_cnt_lsb_minus4: 4,
+                ..Default::default()
+            };
+            self.dpb.h265.sequence_start(dpb_config);
+            self.has_reference = false;
+            self.has_backward_reference = false;
+            // Reset DPB slot activation tracking on IDR - all slots become inactive.
+            for active in &mut self.dpb_slot_active {
+                *active = false;
+            }
+        }
+
+        let pic_order_cnt = gop_position.pic_order_cnt;
+
+        let mut encoded_data = Vec::new();
+
+        // For IDR frames, prepend VPS/SPS/PPS header.
+        if is_idr {
+            if self.header_data.is_none() {
+                let header = self.get_h265_header()?;
+                // Debug: print first few bytes of header.
+                debug!(
+                    "H.265 header ({} bytes): {:02X?}",
+                    header.len(),
+                    &header[..std::cmp::min(32, header.len())]
+                );
+                self.header_data = Some(header);
+            }
+            if let Some(ref header) = self.header_data {
+                encoded_data.extend_from_slice(header);
+            }
+        }
+
+        let slice_data = self.encode_frame_internal(gop_position, pic_order_cnt, is_idr)?;
+        // Debug: print first few bytes of slice data.
+        debug!(
+            "H.265 slice ({} bytes): {:02X?}",
+            slice_data.len(),
+            &slice_data[..std::cmp::min(16, slice_data.len())]
+        );
+        encoded_data.extend_from_slice(&slice_data);
+
+        self.encode_frame_num += 1;
+
+        if is_reference {
+            let dpb_pic_type = if is_idr {
+                PictureType::Idr
+            } else if is_b_frame {
+                PictureType::B
+            } else {
+                PictureType::P
+            };
+            let pic_info = PictureStartInfo {
+                frame_id: display_order,
+                pic_order_cnt,
+                frame_num: 0,
+                pic_type: dpb_pic_type,
+                is_reference,
+                ..Default::default()
+            };
+            self.dpb.h265.picture_start(pic_info);
+            self.dpb.h265.picture_end(is_reference);
+
+            // Update reference tracking for the next P-frame.
+            // The current frame becomes the reference for subsequent frames.
+            self.reference_poc = pic_order_cnt;
+            self.reference_pic_type = picture_type;
+            self.has_reference = true;
+
+            if !is_b_frame {
+                std::mem::swap(&mut self.current_dpb_slot, &mut self.reference_dpb_slot);
+            }
+        }
+
+        Ok(EncodedPacket {
+            data: encoded_data,
+            frame_type,
+            is_key_frame: is_idr,
+            pts: display_order,
+            dts: self.encode_frame_num - 1,
+        })
+    }
+
+    /// Flush the encoder and get any remaining packets.
+    pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
+        // No buffered frames in the current implementation.
+        Ok(Vec::new())
+    }
+
+    /// Request that the next frame be an IDR frame.
+    pub fn request_idr(&mut self) {
+        self.gop.request_idr();
+    }
+
+    /// Retrieve encoded VPS/SPS/PPS header data from video session parameters.
+    /// This uses vkGetEncodedVideoSessionParametersKHR to get the NAL units.
+    fn get_h265_header(&self) -> Result<Vec<u8>> {
+        // H.265-specific get info requesting VPS, SPS and PPS.
+        let mut h265_get_info = vk::VideoEncodeH265SessionParametersGetInfoKHR::default()
+            .write_std_vps(true)
+            .write_std_sps(true)
+            .write_std_pps(true)
+            .std_vps_id(0)
+            .std_sps_id(0)
+            .std_pps_id(0);
+
+        let get_info = vk::VideoEncodeSessionParametersGetInfoKHR {
+            video_session_parameters: self.session_params,
+            p_next: (&mut h265_get_info as *mut vk::VideoEncodeH265SessionParametersGetInfoKHR)
+                .cast(),
+            ..Default::default()
+        };
+
+        // Some implementations misbehave for a size-only query (pData = NULL). Use a
+        // preallocated buffer and retry on INCOMPLETE (vk_video_samples-style).
+        let mut data = vec![0u8; 4096];
+        let mut data_size: usize = data.len();
+        let mut h265_feedback = vk::VideoEncodeH265SessionParametersFeedbackInfoKHR::default();
+        let mut feedback = vk::VideoEncodeSessionParametersFeedbackInfoKHR {
+            p_next: (&mut h265_feedback
+                as *mut vk::VideoEncodeH265SessionParametersFeedbackInfoKHR)
+                .cast(),
+            ..Default::default()
+        };
+
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let result = unsafe {
+                (self
+                    .video_encode_fn
+                    .fp()
+                    .get_encoded_video_session_parameters_khr)(
+                    self.context.device().handle(),
+                    &get_info,
+                    &mut feedback,
+                    &mut data_size,
+                    data.as_mut_ptr() as *mut std::ffi::c_void,
+                )
+            };
+
+            match result {
+                vk::Result::SUCCESS => {
+                    if data_size == 0 {
+                        return Err(PixelForgeError::SessionParametersCreation(
+                            "Encoded parameters size is 0".to_string(),
+                        ));
+                    }
+                    data.truncate(data_size);
+                    return Ok(data);
+                }
+                vk::Result::INCOMPLETE if attempts < 3 => {
+                    let new_size = data_size.max(data.len() * 2).max(1);
+                    data.resize(new_size, 0);
+                    data_size = data.len();
+                }
+                err => {
+                    return Err(PixelForgeError::SessionParametersCreation(format!(
+                        "Failed to get encoded parameters: {:?}",
+                        err
+                    )));
+                }
+            }
+        }
+    }
+}

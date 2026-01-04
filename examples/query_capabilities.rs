@@ -1,0 +1,250 @@
+//! Example: Query Codec Capabilities
+//!
+//! This example demonstrates how to query video codec capabilities.
+//! from the Vulkan video extensions.
+
+use ash::vk;
+use pixelforge::{Codec, VideoContextBuilder};
+use std::ffi::CStr;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("PixelForge Codec Capabilities Example");
+    println!("======================================\n");
+
+    // Build the video context.
+    let context = VideoContextBuilder::new()
+        .app_name("Capabilities Example")
+        .app_version(1, 0, 0)
+        .enable_validation(cfg!(debug_assertions))
+        .build()?;
+
+    println!("Video Context Created\n");
+
+    // Load video queue fn to get capabilities
+    let video_queue_fn = ash::khr::video_queue::Instance::load(context.entry(), context.instance());
+
+    // Query codec support.
+    println!("Codec Support:");
+    println!("--------------");
+
+    let codecs = [Codec::H264, Codec::H265];
+
+    for codec in codecs {
+        println!("\n{:?}:", codec);
+
+        // Check encode support.
+        let encode_supported = context.supports_encode(codec);
+        println!(
+            "  Encode: {}",
+            if encode_supported {
+                "✓ Supported"
+            } else {
+                "✗ Not supported"
+            }
+        );
+
+        if encode_supported {
+            query_detailed_capabilities(&context, codec, &video_queue_fn)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn query_detailed_capabilities(
+    context: &pixelforge::VideoContext,
+    codec: Codec,
+    video_queue_fn: &ash::khr::video_queue::Instance,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let physical_device = context.physical_device();
+
+    let combinations = [
+        (
+            vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            "4:2:0 8-bit",
+        ),
+        (
+            vk::VideoChromaSubsamplingFlagsKHR::TYPE_444,
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            "4:4:4 8-bit",
+        ),
+        (
+            vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
+            "4:2:0 10-bit",
+        ),
+        (
+            vk::VideoChromaSubsamplingFlagsKHR::TYPE_444,
+            vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
+            "4:4:4 10-bit",
+        ),
+    ];
+
+    for (subsampling, bit_depth, desc) in combinations {
+        println!("    Checking {}: ", desc);
+
+        // Construct profile info
+        let (mut profile_info, mut h264_profile, mut h265_profile) = match codec {
+            Codec::H264 => {
+                let profile_idc = if subsampling == vk::VideoChromaSubsamplingFlagsKHR::TYPE_444 {
+                    ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
+                } else {
+                    ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
+                };
+
+                let h264 =
+                    vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc);
+                let info = vk::VideoProfileInfoKHR::default()
+                    .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+                    .chroma_subsampling(subsampling)
+                    .luma_bit_depth(bit_depth)
+                    .chroma_bit_depth(bit_depth);
+                (info, Some(h264), None)
+            }
+            Codec::H265 => {
+                let profile_idc = if subsampling == vk::VideoChromaSubsamplingFlagsKHR::TYPE_444 {
+                    ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_FORMAT_RANGE_EXTENSIONS
+                } else if bit_depth == vk::VideoComponentBitDepthFlagsKHR::TYPE_10 {
+                    ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10
+                } else {
+                    ash::vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN
+                };
+
+                let h265 =
+                    vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
+                let info = vk::VideoProfileInfoKHR::default()
+                    .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+                    .chroma_subsampling(subsampling)
+                    .luma_bit_depth(bit_depth)
+                    .chroma_bit_depth(bit_depth);
+                (info, None, Some(h265))
+            }
+            _ => return Ok(()),
+        };
+
+        if let Some(h264) = &mut h264_profile {
+            profile_info.p_next = (h264 as *mut vk::VideoEncodeH264ProfileInfoKHR).cast();
+        }
+        if let Some(h265) = &mut h265_profile {
+            profile_info.p_next = (h265 as *mut vk::VideoEncodeH265ProfileInfoKHR).cast();
+        }
+
+        // 1. Query Video Capabilities
+        let mut caps = vk::VideoCapabilitiesKHR::default();
+        let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
+        caps.p_next = (&mut encode_caps as *mut vk::VideoEncodeCapabilitiesKHR).cast();
+
+        let mut h264_caps = vk::VideoEncodeH264CapabilitiesKHR::default();
+        let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
+
+        if codec == Codec::H264 {
+            encode_caps.p_next = (&mut h264_caps as *mut vk::VideoEncodeH264CapabilitiesKHR).cast();
+        } else if codec == Codec::H265 {
+            encode_caps.p_next = (&mut h265_caps as *mut vk::VideoEncodeH265CapabilitiesKHR).cast();
+        }
+
+        let result = unsafe {
+            (video_queue_fn
+                .fp()
+                .get_physical_device_video_capabilities_khr)(
+                physical_device,
+                &profile_info,
+                &mut caps,
+            )
+        };
+
+        if result != vk::Result::SUCCESS {
+            println!("      Not Supported ({:?})", result);
+            continue;
+        }
+        println!("      Supported");
+        println!(
+            "      Max Dimenstions: {}x{}",
+            caps.max_coded_extent.width, caps.max_coded_extent.height
+        );
+        println!(
+            "      Max Reference Pictures: {}",
+            caps.max_active_reference_pictures
+        );
+        println!("      Max DPB Slots: {}", caps.max_dpb_slots);
+
+        // 2. Query Supported Formats
+        let mut format_props_count = 0;
+        let mut format_props_list =
+            vk::VideoProfileListInfoKHR::default().profiles(std::slice::from_ref(&profile_info));
+
+        // Check for Input Image support (VIDEO_ENCODE_SRC_KHR)
+        let mut format_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+            .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR);
+        format_info.p_next = (&mut format_props_list as *mut vk::VideoProfileListInfoKHR).cast();
+
+        let result = unsafe {
+            (video_queue_fn
+                .fp()
+                .get_physical_device_video_format_properties_khr)(
+                physical_device,
+                &format_info,
+                &mut format_props_count,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if result == vk::Result::SUCCESS {
+            let mut format_props =
+                vec![vk::VideoFormatPropertiesKHR::default(); format_props_count as usize];
+            unsafe {
+                let _ = (video_queue_fn
+                    .fp()
+                    .get_physical_device_video_format_properties_khr)(
+                    physical_device,
+                    &format_info,
+                    &mut format_props_count,
+                    format_props.as_mut_ptr(),
+                );
+            };
+            println!("      Supported Input Formats (SRC):");
+            for prop in format_props {
+                println!("        Format: {:?}", prop.format);
+            }
+        }
+
+        // Check for DPB Image support (VIDEO_ENCODE_DPB_KHR)
+        let mut format_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+            .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR);
+        format_info.p_next = (&mut format_props_list as *mut vk::VideoProfileListInfoKHR).cast();
+
+        let mut format_props_count = 0;
+        let result = unsafe {
+            (video_queue_fn
+                .fp()
+                .get_physical_device_video_format_properties_khr)(
+                physical_device,
+                &format_info,
+                &mut format_props_count,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if result == vk::Result::SUCCESS {
+            let mut format_props =
+                vec![vk::VideoFormatPropertiesKHR::default(); format_props_count as usize];
+            unsafe {
+                let _ = (video_queue_fn
+                    .fp()
+                    .get_physical_device_video_format_properties_khr)(
+                    physical_device,
+                    &format_info,
+                    &mut format_props_count,
+                    format_props.as_mut_ptr(),
+                );
+            };
+            println!("      Supported DPB Formats (DPB):");
+            for prop in format_props {
+                println!("        Format: {:?}", prop.format);
+            }
+        }
+    }
+
+    Ok(())
+}
