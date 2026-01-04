@@ -131,6 +131,12 @@ cargo run --example encode_h264
 cargo run --example encode_h265
 ```
 
+## TODO's
+
+1. [] Decoding.
+1. [] B-frames support.
+1. [] AV1 support (depends on a new version of ash with more up-to-date Vulkan support).
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
