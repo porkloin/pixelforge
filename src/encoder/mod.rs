@@ -342,13 +342,14 @@ impl Encoder {
     ///
     /// Use `InputImage` to create an image from YUV data:
     /// ```no_run
-    /// use pixelforge::{InputImage, Encoder, EncodeConfig, EncodeBitDepth, PixelFormat, VideoContext};
+    /// use pixelforge::{InputImage, Encoder, EncodeConfig, EncodeBitDepth, PixelFormat, VideoContext, Codec};
     ///
     /// # fn example(context: VideoContext) -> Result<(), Box<dyn std::error::Error>> {
     /// let config = EncodeConfig::h264(1920, 1080);
     /// let mut encoder = Encoder::new(context.clone(), config)?;
     /// let mut input = InputImage::new(
     ///     context,
+    ///     Codec::H264,
     ///     1920,
     ///     1080,
     ///     EncodeBitDepth::Eight,

@@ -96,6 +96,7 @@
 //!     // Create an InputImage helper for uploading YUV data to the GPU.
 //!     let mut input_image = InputImage::new(
 //!         context.clone(),
+//!         Codec::H264,
 //!         1920,
 //!         1080,
 //!         EncodeBitDepth::Eight,
