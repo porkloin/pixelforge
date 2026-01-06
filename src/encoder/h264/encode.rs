@@ -17,16 +17,12 @@ impl H264Encoder {
         let is_reference = gop_position.is_reference;
 
         debug!(
-            "encode_frame_internal: frame_num={}, poc={}, is_idr={}, has_reference={}, \
-             current_dpb_slot={}, reference_dpb_slot={}, reference_frame_num={}, reference_poc={}",
+            "encode_frame_internal: frame_num={}, poc={}, is_idr={}, refs_len={}, current_dpb_slot={}",
             frame_num,
             pic_order_cnt,
             is_idr,
-            self.has_reference,
-            self.current_dpb_slot,
-            self.reference_dpb_slot,
-            self.reference_frame_num,
-            self.reference_poc
+            self.l0_references.len(),
+            self.current_dpb_slot
         );
 
         // Rate control setup.
@@ -199,20 +195,47 @@ impl H264Encoder {
         // Set up reference lists for P-frames and B-frames.
         // P-frames: L0 only (reference previous frame)
         // B-frames: L0 (forward/past) and L1 (backward/future)
-        let (num_ref_l0, num_ref_l1) =
-            if is_b_frame && self.has_reference && self.has_backward_reference {
-                // B-frame: both L0 and L1 references.
-                ref_list0[0] = self.reference_dpb_slot; // L0: forward reference (past)
-                ref_list1[0] = self.backward_reference_dpb_slot; // L1: backward reference (future)
+        let (num_ref_l0, num_ref_l1) = if is_b_frame && self.has_backward_reference {
+            // B-frame: both L0 and L1 references.
+            if let Some(first_ref) = self.l0_references.first() {
+                ref_list0[0] = first_ref.dpb_slot;
+                ref_list1[0] = self.backward_reference_dpb_slot;
                 (1, 1)
-            } else if !is_idr && self.has_reference {
-                // P-frame: only L0 reference.
-                ref_list0[0] = self.reference_dpb_slot;
-                (1, 0)
             } else {
-                // IDR: no references.
                 (0, 0)
-            };
+            }
+        } else if !is_idr && !self.l0_references.is_empty() {
+            // P-frame: L0 reference list.
+            // WE MUST FILL THE LIST UP TO THE PPS DEFAULT COUNT using duplicates if needed.
+
+            // Use negotiated active count.
+            let target_count = self.active_reference_count as usize;
+            let count = self.l0_references.len();
+
+            // 1. Fill actual references
+            for (i, ref_info) in self.l0_references.iter().enumerate() {
+                if i < 32 {
+                    ref_list0[i] = ref_info.dpb_slot;
+                }
+            }
+
+            // 2. Pad with duplicates of the last reference if needed to reach target_count
+            if count < target_count && count > 0 {
+                let last_slot = ref_list0[count - 1];
+                let end = target_count.min(32);
+                ref_list0[count..end].fill(last_slot);
+            }
+
+            // We provide target_count entries if we have at least 1, otherwise 0.
+            (target_count.min(32), 0)
+        } else {
+            // IDR: no references.
+            (0, 0)
+        };
+
+        // Note: num_ref_idx_l0_active_minus1 in ReferenceListsInfo tells the driver/hardware
+        // how many entries in our RefPicList0 array are valid.
+        // Since we ensure 3 entries are valid (by duplicating), we set this to 2.
 
         let ref_lists_info = ash::vk::native::StdVideoEncodeH264ReferenceListsInfo {
             flags: ref_lists_info_flags,
@@ -247,7 +270,7 @@ impl H264Encoder {
             PicOrderCnt: pic_order_cnt,
             temporal_id: 0,
             reserved1: [0; 3],
-            pRefLists: if !is_idr && self.has_reference {
+            pRefLists: if !is_idr && !self.l0_references.is_empty() {
                 &ref_lists_info
             } else {
                 std::ptr::null()
@@ -290,17 +313,8 @@ impl H264Encoder {
             .base_array_layer(0)
             .image_view_binding(self.dpb_image_views[self.current_dpb_slot as usize]);
 
-        // Set up reference picture resource (for P-frames, references previous frame)
-        let reference_picture_resource = vk::VideoPictureResourceInfoKHR::default()
-            .coded_offset(vk::Offset2D { x: 0, y: 0 })
-            .coded_extent(vk::Extent2D {
-                width: self.config.dimensions.width,
-                height: self.config.dimensions.height,
-            })
-            .base_array_layer(0)
-            .image_view_binding(self.dpb_image_views[self.reference_dpb_slot as usize]);
+        // Set up reference picture resources and info.
 
-        // Create H.264 reference info for the setup slot (this frame being encoded)
         let std_reference_info_flags = ash::vk::native::StdVideoEncodeH264ReferenceInfoFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoEncodeH264ReferenceInfoFlags::new_bitfield_1(
@@ -309,6 +323,102 @@ impl H264Encoder {
             ),
         };
 
+        // We use vectors to hold the data to ensure stable memory addresses for pointers.
+        let mut l0_resources = Vec::with_capacity(self.l0_references.len());
+        let mut l0_std_infos = Vec::with_capacity(self.l0_references.len());
+
+        // 1. Populate data for L0 references (P-frames and B-frames)
+        for ref_info in &self.l0_references {
+            l0_resources.push(
+                vk::VideoPictureResourceInfoKHR::default()
+                    .coded_offset(vk::Offset2D { x: 0, y: 0 })
+                    .coded_extent(vk::Extent2D {
+                        width: self.config.dimensions.width,
+                        height: self.config.dimensions.height,
+                    })
+                    .base_array_layer(0)
+                    .image_view_binding(self.dpb_image_views[ref_info.dpb_slot as usize]),
+            );
+
+            l0_std_infos.push(ash::vk::native::StdVideoEncodeH264ReferenceInfo {
+                flags: std_reference_info_flags,
+                primary_pic_type:
+                    ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P,
+                FrameNum: ref_info.frame_num,
+                PicOrderCnt: ref_info.poc,
+                long_term_pic_num: 0,
+                long_term_frame_idx: 0,
+                temporal_id: 0,
+            });
+        }
+
+        // 2. Create DPB slot infos for L0.
+        // MUST be done after l0_std_infos is fully populated so addresses don't change.
+        let mut l0_dpb_slot_infos = Vec::with_capacity(l0_std_infos.len());
+        for std_info in &l0_std_infos {
+            l0_dpb_slot_infos
+                .push(vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(std_info));
+        }
+
+        // 3. Create the L0 reference slots.
+        let mut l0_slots = Vec::with_capacity(l0_resources.len());
+        for (i, (resource, dpb_info)) in l0_resources
+            .iter()
+            .zip(l0_dpb_slot_infos.iter_mut())
+            .enumerate()
+        {
+            let ref_info = &self.l0_references[i];
+            let mut slot = vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(ref_info.dpb_slot as i32)
+                .picture_resource(resource);
+            slot.p_next = (dpb_info as *mut vk::VideoEncodeH264DpbSlotInfoKHR).cast();
+            l0_slots.push(slot);
+        }
+
+        // 4. Handle Backward Ref (L1) for B-frames
+        let (backward_resource, backward_std_info) = if is_b_frame && self.has_backward_reference {
+            let image_view = self.dpb_image_views[self.backward_reference_dpb_slot as usize];
+            let resource = vk::VideoPictureResourceInfoKHR::default()
+                .coded_offset(vk::Offset2D { x: 0, y: 0 })
+                .coded_extent(vk::Extent2D {
+                    width: self.config.dimensions.width,
+                    height: self.config.dimensions.height,
+                })
+                .base_array_layer(0)
+                .image_view_binding(image_view);
+
+            let std_info = ash::vk::native::StdVideoEncodeH264ReferenceInfo {
+                flags: std_reference_info_flags,
+                primary_pic_type:
+                    ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P,
+                FrameNum: self.backward_reference_frame_num,
+                PicOrderCnt: self.backward_reference_poc,
+                long_term_pic_num: 0,
+                long_term_frame_idx: 0,
+                temporal_id: 0,
+            };
+            (Some(resource), Some(std_info))
+        } else {
+            (None, None)
+        };
+
+        let mut backward_dpb_info = if let Some(ref std_info) = backward_std_info {
+            vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(std_info)
+        } else {
+            vk::VideoEncodeH264DpbSlotInfoKHR::default()
+        };
+
+        let backward_ref_slot = if let Some(ref resource) = backward_resource {
+            let mut slot = vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(self.backward_reference_dpb_slot as i32)
+                .picture_resource(resource);
+            slot.p_next = (&mut backward_dpb_info as *mut vk::VideoEncodeH264DpbSlotInfoKHR).cast();
+            Some(slot)
+        } else {
+            None
+        };
+
+        // Create H.264 reference info for the setup slot (this frame being encoded)
         let std_reference_info = ash::vk::native::StdVideoEncodeH264ReferenceInfo {
             flags: std_reference_info_flags,
             primary_pic_type: if is_idr {
@@ -333,151 +443,57 @@ impl H264Encoder {
         setup_reference_slot.p_next =
             (&mut h264_dpb_slot_info as *mut vk::VideoEncodeH264DpbSlotInfoKHR).cast();
 
-        // For P-frames and B-frames, we need reference info for L0 (forward reference)
-        let ref_std_reference_info = ash::vk::native::StdVideoEncodeH264ReferenceInfo {
-            flags: std_reference_info_flags,
-            primary_pic_type:
-                ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P,
-            FrameNum: self.reference_frame_num,
-            PicOrderCnt: self.reference_poc,
-            long_term_pic_num: 0,
-            long_term_frame_idx: 0,
-            temporal_id: 0,
-        };
-
-        let mut ref_h264_dpb_slot_info = vk::VideoEncodeH264DpbSlotInfoKHR::default()
-            .std_reference_info(&ref_std_reference_info);
-
-        // For B-frames, we also need L1 (backward reference - the future frame already encoded)
-        // Only create these if B-frames are enabled (b_frame_count > 0)
-        let has_b_frames = self.config.b_frame_count > 0;
-
-        // Create a dummy image view for when B-frames are disabled.
-        // This avoids index out of bounds when backward_reference_dpb_slot >= dpb_image_views.len()
-        let backward_ref_image_view = if has_b_frames {
-            self.dpb_image_views[self.backward_reference_dpb_slot as usize]
-        } else {
-            // Use first DPB slot as placeholder (won't actually be used)
-            self.dpb_image_views[0]
-        };
-
-        let backward_reference_picture_resource = vk::VideoPictureResourceInfoKHR::default()
-            .coded_offset(vk::Offset2D { x: 0, y: 0 })
-            .coded_extent(vk::Extent2D {
-                width: self.config.dimensions.width,
-                height: self.config.dimensions.height,
-            })
-            .base_array_layer(0)
-            .image_view_binding(backward_ref_image_view);
-
-        let backward_ref_std_reference_info = ash::vk::native::StdVideoEncodeH264ReferenceInfo {
-            flags: std_reference_info_flags,
-            primary_pic_type:
-                ash::vk::native::StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P,
-            FrameNum: self.backward_reference_frame_num,
-            PicOrderCnt: self.backward_reference_poc,
-            long_term_pic_num: 0,
-            long_term_frame_idx: 0,
-            temporal_id: 0,
-        };
-
-        let mut backward_ref_h264_dpb_slot_info = vk::VideoEncodeH264DpbSlotInfoKHR::default()
-            .std_reference_info(&backward_ref_std_reference_info);
-
-        // Build reference slots array similar to NVIDIA:
-        // - referenceSlotsInfo[0] = setup slot (will have slotIndex=-1 for begin)
-        // - referenceSlotsInfo[1] = L0 reference slot (for P-frames and B-frames)
-        // - referenceSlotsInfo[2] = L1 reference slot (for B-frames only)
-        //
-        // For encodeInfo:
-        //   - pReferenceSlots points to slot[1...] (skip setup)
-        //   - referenceSlotCount = number of actual references
-        //
-        // For beginInfo:
-        //   - pReferenceSlots points to slot[0...] (includes all)
-        //   - referenceSlotCount = setup + references
-        //   - slot[0].slotIndex = -1 (mark setup as inactive)
-
-        // Create a separate DPB slot info for the begin slot.
+        // Also create a setup slot for begin_info (slotIndex = -1)
         let mut h264_begin_dpb_slot_info =
             vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(&std_reference_info);
 
-        // Setup slot for begin (will be modified to slotIndex=-1)
         let mut setup_slot_for_begin = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(self.current_dpb_slot as i32) // Will be set to -1 for begin
+            .slot_index(-1) // Marked as inactive for begin
             .picture_resource(&setup_picture_resource);
         setup_slot_for_begin.p_next =
             (&mut h264_begin_dpb_slot_info as *mut vk::VideoEncodeH264DpbSlotInfoKHR).cast();
 
-        // L0 Reference slot for P-frames and B-frames (forward reference)
-        let mut ref_slot = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(self.reference_dpb_slot as i32)
-            .picture_resource(&reference_picture_resource);
-        ref_slot.p_next =
-            (&mut ref_h264_dpb_slot_info as *mut vk::VideoEncodeH264DpbSlotInfoKHR).cast();
+        // Collect final reference slots for VIDEO ENCODE INFO
+        let mut encode_ref_slots = Vec::new();
+        if is_b_frame && self.has_backward_reference {
+            // B-Frames: Use first L0 (forward) + L1 (backward)
+            if let Some(l0) = l0_slots.first() {
+                encode_ref_slots.push(*l0);
+            }
+            if let Some(l1) = backward_ref_slot {
+                encode_ref_slots.push(l1);
+            }
+        } else if !is_idr {
+            // P-Frames: Use all L0
+            encode_ref_slots.extend_from_slice(&l0_slots);
+        }
 
-        // L1 Reference slot for B-frames (backward reference - future frame)
-        let mut backward_ref_slot = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(self.backward_reference_dpb_slot as i32)
-            .picture_resource(&backward_reference_picture_resource);
-        backward_ref_slot.p_next =
-            (&mut backward_ref_h264_dpb_slot_info as *mut vk::VideoEncodeH264DpbSlotInfoKHR).cast();
+        let mut encode_info = vk::VideoEncodeInfoKHR::default()
+            .dst_buffer(self.bitstream_buffer)
+            .dst_buffer_offset(0)
+            .dst_buffer_range(MIN_BITSTREAM_BUFFER_SIZE as vk::DeviceSize)
+            .src_picture_resource(src_picture_resource)
+            .setup_reference_slot(&setup_reference_slot);
 
-        // Create encode info based on frame type.
-        // For B-frames we need both L0 and L1 references.
-        let reference_slots_for_encode_p = [ref_slot];
-        let reference_slots_for_encode_b = [ref_slot, backward_ref_slot];
+        if !encode_ref_slots.is_empty() {
+            encode_info = encode_info.reference_slots(&encode_ref_slots);
+        }
 
-        let mut encode_info = if is_b_frame && self.has_reference && self.has_backward_reference {
-            // B-frame: include both L0 (forward) and L1 (backward) reference slots.
-            vk::VideoEncodeInfoKHR::default()
-                .dst_buffer(self.bitstream_buffer)
-                .dst_buffer_offset(0)
-                .dst_buffer_range(MIN_BITSTREAM_BUFFER_SIZE as vk::DeviceSize)
-                .src_picture_resource(src_picture_resource)
-                .setup_reference_slot(&setup_reference_slot)
-                .reference_slots(&reference_slots_for_encode_b)
-        } else if !is_idr && self.has_reference {
-            // P-frame: include L0 reference slot only.
-            vk::VideoEncodeInfoKHR::default()
-                .dst_buffer(self.bitstream_buffer)
-                .dst_buffer_offset(0)
-                .dst_buffer_range(MIN_BITSTREAM_BUFFER_SIZE as vk::DeviceSize)
-                .src_picture_resource(src_picture_resource)
-                .setup_reference_slot(&setup_reference_slot)
-                .reference_slots(&reference_slots_for_encode_p)
-        } else {
-            // IDR: no reference slots needed.
-            vk::VideoEncodeInfoKHR::default()
-                .dst_buffer(self.bitstream_buffer)
-                .dst_buffer_offset(0)
-                .dst_buffer_range(MIN_BITSTREAM_BUFFER_SIZE as vk::DeviceSize)
-                .src_picture_resource(src_picture_resource)
-                .setup_reference_slot(&setup_reference_slot)
-        };
         encode_info.p_next =
             (&mut h264_picture_info as *mut vk::VideoEncodeH264PictureInfoKHR).cast();
 
-        // For begin video coding, we need to include all picture resources that will be used.
-        // The setup slot must be included with slotIndex=-1 to indicate it's not yet active.
-        // Following NVIDIA's approach:
-        // - referenceSlotsInfo[0] = setup slot (slotIndex=-1)
-        // - referenceSlotsInfo[1...] = reference slots (actual indices)
-        //
-        // - For begin: pReferenceSlots points to slot[0...]
-        setup_slot_for_begin = setup_slot_for_begin.slot_index(-1);
-
-        let reference_slots_for_begin =
-            if is_b_frame && self.has_reference && self.has_backward_reference {
-                // B-frame: include setup slot (inactive), L0 reference, and L1 reference.
-                vec![setup_slot_for_begin, ref_slot, backward_ref_slot]
-            } else if !is_idr && self.has_reference {
-                // P-frame: include setup slot (inactive) and L0 reference slot.
-                vec![setup_slot_for_begin, ref_slot]
-            } else {
-                // IDR: just the setup slot (inactive)
-                vec![setup_slot_for_begin]
-            };
+        // Collect reference slots for BEGIN VIDEO CODING
+        let mut reference_slots_for_begin = vec![setup_slot_for_begin];
+        if is_b_frame && self.has_backward_reference {
+            if let Some(l0) = l0_slots.first() {
+                reference_slots_for_begin.push(*l0);
+            }
+            if let Some(l1) = backward_ref_slot {
+                reference_slots_for_begin.push(l1);
+            }
+        } else if !is_idr {
+            reference_slots_for_begin.extend_from_slice(&l0_slots);
+        }
 
         let min_qp_val = if rc_mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED
             || self.config.rate_control_mode == crate::encoder::RateControlMode::Cqp

@@ -61,15 +61,6 @@ impl H265Encoder {
             GopFrameType::B => crate::encoder::FrameType::B,
         };
 
-        // Compute picture type for reference info.
-        let picture_type = if is_idr {
-            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
-        } else if is_b_frame {
-            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_B
-        } else {
-            ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
-        };
-
         debug!(
             "Encoding frame: display_order={}, type={:?}, idr={}, ref={}",
             display_order, frame_type, is_idr, is_reference
@@ -86,7 +77,7 @@ impl H265Encoder {
                 ..Default::default()
             };
             self.dpb.h265.sequence_start(dpb_config);
-            self.has_reference = false;
+            self.l0_references.clear();
             self.has_backward_reference = false;
             // Reset DPB slot activation tracking on IDR - all slots become inactive.
             for active in &mut self.dpb_slot_active {
@@ -147,12 +138,31 @@ impl H265Encoder {
 
             // Update reference tracking for the next P-frame.
             // The current frame becomes the reference for subsequent frames.
-            self.reference_poc = pic_order_cnt;
-            self.reference_pic_type = picture_type;
-            self.has_reference = true;
+            let ref_info = super::ReferenceInfo {
+                dpb_slot: self.current_dpb_slot,
+                poc: pic_order_cnt,
+            };
+            self.l0_references.insert(0, ref_info);
+
+            // Limit to active_reference_count
+            while self.l0_references.len() > self.active_reference_count as usize {
+                self.l0_references.pop();
+            }
 
             if !is_b_frame {
-                std::mem::swap(&mut self.current_dpb_slot, &mut self.reference_dpb_slot);
+                // Find a free DPB slot for the next frame.
+                // Avoid slots currently in l0_references.
+                // B-frames don't consume a slot permanently (in this simple implementation they are not reference),
+                // but if we support B-frame references we need more complex logic.
+                // Assuming B-frames are not reference for now (is_reference=false for B in this impl usually).
+
+                let used_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
+                for i in 0..self.dpb_slot_count as u8 {
+                    if !used_slots.contains(&i) {
+                        self.current_dpb_slot = i;
+                        break;
+                    }
+                }
             }
         }
 

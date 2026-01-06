@@ -22,6 +22,12 @@ const MIN_BITSTREAM_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 /// H.265 Coding Tree Block (CTB) size in pixels.
 pub const CTB_SIZE: u32 = 32;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReferenceInfo {
+    pub dpb_slot: u8,
+    pub poc: i32,
+}
+
 /// H.265 encoder.
 pub struct H265Encoder {
     context: VideoContext,
@@ -74,10 +80,6 @@ pub struct H265Encoder {
     header_data: Option<Vec<u8>>,
 
     // Reference picture tracking.
-    /// Whether we have an active reference picture in the DPB (for P-frames, L0).
-    has_reference: bool,
-    /// POC of the L0 reference picture.
-    reference_poc: i32,
     /// Whether we have a backward reference (for B-frames, L1).
     has_backward_reference: bool,
     /// POC of the L1 (backward) reference picture.
@@ -86,10 +88,10 @@ pub struct H265Encoder {
     backward_reference_dpb_slot: u8,
     /// Current DPB slot to use for setup (the reconstructed picture).
     current_dpb_slot: u8,
-    /// DPB slot containing the L0 (forward) reference picture.
-    reference_dpb_slot: u8,
-    /// Picture type of the L0 reference picture (I, P, or B).
-    reference_pic_type: u32,
+    /// Active L0 reference pictures (for P-frames).
+    l0_references: Vec<ReferenceInfo>,
+    /// Number of active reference frames.
+    active_reference_count: u32,
 
     // DPB slot activation tracking.
     /// Tracks which DPB slots have been activated (used at least once).

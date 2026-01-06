@@ -23,6 +23,13 @@ const MIN_BITSTREAM_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 /// H.264 macroblock size in pixels.
 pub const MB_SIZE: u32 = 16;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReferenceInfo {
+    pub dpb_slot: u8,
+    pub frame_num: u32,
+    pub poc: i32,
+}
+
 /// H.264 encoder.
 pub struct H264Encoder {
     context: VideoContext,
@@ -72,12 +79,6 @@ pub struct H264Encoder {
     sps_written: bool,
 
     // Reference picture tracking.
-    /// Whether we have an active reference picture in the DPB (for P-frames, L0).
-    has_reference: bool,
-    /// Frame number of the L0 reference picture (for P and B frames).
-    reference_frame_num: u32,
-    /// POC of the L0 reference picture.
-    reference_poc: i32,
     /// Whether we have a backward reference (for B-frames, L1).
     has_backward_reference: bool,
     /// Frame number of the L1 (backward) reference picture (for B-frames).
@@ -88,8 +89,10 @@ pub struct H264Encoder {
     backward_reference_dpb_slot: u8,
     /// Current DPB slot to use for setup (the reconstructed picture).
     current_dpb_slot: u8,
-    /// DPB slot containing the L0 (forward) reference picture.
-    reference_dpb_slot: u8,
+    /// Active L0 reference pictures (for P-frames). Ordered from most recent to oldest.
+    l0_references: Vec<ReferenceInfo>,
+    /// Number of active reference frames (as configured/negotiated).
+    active_reference_count: u32,
 }
 
 impl H264Encoder {

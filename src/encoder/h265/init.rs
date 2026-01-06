@@ -89,20 +89,85 @@ impl H265Encoder {
         profile_info.p_next =
             (&mut h265_profile_info as *mut vk::VideoEncodeH265ProfileInfoKHR).cast();
 
+        // Query capabilities to determine limits.
+        let video_queue_instance =
+            ash::khr::video_queue::Instance::load(context.entry(), context.instance());
+        let mut h265_capabilities = vk::VideoEncodeH265CapabilitiesKHR::default();
+        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR {
+            p_next: (&mut h265_capabilities as *mut vk::VideoEncodeH265CapabilitiesKHR).cast(),
+            ..Default::default()
+        };
+        let mut capabilities = vk::VideoCapabilitiesKHR {
+            p_next: (&mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR).cast(),
+            ..Default::default()
+        };
+
+        let result = unsafe {
+            (video_queue_instance
+                .fp()
+                .get_physical_device_video_capabilities_khr)(
+                context.physical_device(),
+                &profile_info,
+                &mut capabilities,
+            )
+        };
+        if result != vk::Result::SUCCESS {
+            return Err(PixelForgeError::NoSuitableDevice(format!(
+                "Failed to query H.265 capabilities: {:?}",
+                result
+            )));
+        }
+
+        let max_dpb_slots_supported = capabilities.max_dpb_slots as usize;
+        let max_active_reference_pictures_supported =
+            capabilities.max_active_reference_pictures as usize;
+
+        if max_dpb_slots_supported < 2 {
+            return Err(PixelForgeError::NoSuitableDevice(format!(
+                "Device reports max_dpb_slots={} for this profile; need at least 2",
+                max_dpb_slots_supported
+            )));
+        }
+
+        // Target number of active reference pictures.
+        let mut target_active_refs = (config.max_reference_frames as usize)
+            .min(max_active_reference_pictures_supported)
+            .min(15); // H.265 limit
+
+        if target_active_refs < 1 && max_active_reference_pictures_supported >= 1 {
+            target_active_refs = 1;
+        }
+
+        // Calculate needed DPB slots
+        let needed_dpb_slots = if config.b_frame_count > 0 {
+            target_active_refs + config.b_frame_count as usize + 2
+        } else {
+            target_active_refs + 1
+        };
+
+        let dpb_slot_count = needed_dpb_slots
+            .min(max_dpb_slots_supported)
+            .min(crate::encoder::dpb::MAX_DPB_SLOTS);
+
+        // Final clamp
+        let max_active_reference_pictures =
+            target_active_refs.min(dpb_slot_count.saturating_sub(1));
+
+        debug!(
+            "Allocating {} DPB slots (req {}, max {}), active refs {} (req {}, max {})",
+            dpb_slot_count,
+            needed_dpb_slots,
+            max_dpb_slots_supported,
+            max_active_reference_pictures,
+            target_active_refs,
+            max_active_reference_pictures_supported
+        );
+
         // Create video session.
         let std_header_version = vk::ExtensionProperties {
             extension_name: make_codec_name(b"VK_STD_vulkan_video_codec_h265_encode"),
             spec_version: vk::make_api_version(0, 1, 0, 0),
         };
-
-        // Calculate required DPB slots based on GOP structure
-        let dpb_slot_count = if config.b_frame_count > 0 {
-            let needed = 2 + config.b_frame_count as usize + 2;
-            needed.min(crate::encoder::dpb::MAX_DPB_SLOTS)
-        } else {
-            2
-        };
-        debug!("Allocating {} DPB slots", dpb_slot_count);
 
         let encode_queue_family = context.video_encode_queue_family().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue family available".to_string())
@@ -119,7 +184,7 @@ impl H265Encoder {
             })
             .reference_picture_format(video_format)
             .max_dpb_slots(dpb_slot_count as u32)
-            .max_active_reference_pictures((dpb_slot_count - 1) as u32)
+            .max_active_reference_pictures(max_active_reference_pictures as u32)
             .std_header_version(&std_header_version);
 
         let mut session = vk::VideoSessionKHR::null();
@@ -300,7 +365,7 @@ impl H265Encoder {
             max_transform_hierarchy_depth_inter: (ctb_log2_size_y - log2_min_transform_block_size)
                 .max(1),
             max_transform_hierarchy_depth_intra: 3,
-            num_short_term_ref_pic_sets: 1,
+            num_short_term_ref_pic_sets: 0,
             num_long_term_ref_pics_sps: 0,
             pcm_sample_bit_depth_luma_minus1: 7,
             pcm_sample_bit_depth_chroma_minus1: 7,
@@ -627,14 +692,12 @@ impl H265Encoder {
             encode_fence,
             query_pool,
             header_data: None,
-            has_reference: false,
-            reference_poc: 0,
             has_backward_reference: false,
             backward_reference_poc: 0,
             backward_reference_dpb_slot: 2,
             current_dpb_slot: 0,
-            reference_dpb_slot: 1,
-            reference_pic_type: 0,
+            l0_references: Vec::new(),
+            active_reference_count: max_active_reference_pictures as u32,
             dpb_slot_active,
         })
     }

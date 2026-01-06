@@ -79,7 +79,7 @@ impl H264Encoder {
                 ..Default::default()
             };
             self.dpb.h264.sequence_start(dpb_config);
-            self.has_reference = false;
+            self.l0_references.clear();
             self.has_backward_reference = false;
         }
 
@@ -125,11 +125,25 @@ impl H264Encoder {
 
             // Update reference tracking for the next P-frame.
             // The current frame becomes the reference for subsequent frames.
-            self.reference_frame_num = frame_num;
-            self.reference_poc = pic_order_cnt;
-            self.has_reference = true;
+            let ref_info = super::ReferenceInfo {
+                dpb_slot: self.current_dpb_slot,
+                frame_num,
+                poc: pic_order_cnt,
+            };
+            self.l0_references.insert(0, ref_info);
+            // Limit to negotiated max active internal references
+            while self.l0_references.len() > self.active_reference_count as usize {
+                self.l0_references.pop();
+            }
 
-            std::mem::swap(&mut self.current_dpb_slot, &mut self.reference_dpb_slot);
+            // Find a free DPB slot for the next frame.
+            let used_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
+            for i in 0..self.dpb_slot_count as u8 {
+                if !used_slots.contains(&i) {
+                    self.current_dpb_slot = i;
+                    break;
+                }
+            }
         }
 
         Ok(EncodedPacket {

@@ -221,15 +221,11 @@ impl H264Encoder {
             spec_version: vk::make_api_version(0, 1, 0, 0),
         };
 
-        // Calculate required DPB slots based on GOP structure, then clamp to device limits.
-        let requested_dpb_slots = if config.b_frame_count > 0 {
-            let needed = 2 + config.b_frame_count as usize + 2;
-            needed.min(crate::encoder::dpb::MAX_DPB_SLOTS)
-        } else {
-            2
-        };
-
+        // Calculate required DPB slots and active references.
         let max_dpb_slots_supported = capabilities.max_dpb_slots as usize;
+        let max_active_reference_pictures_supported =
+            capabilities.max_active_reference_pictures as usize;
+
         if max_dpb_slots_supported < 2 {
             return Err(PixelForgeError::NoSuitableDevice(format!(
                 "Device reports max_dpb_slots={} for this profile; need at least 2",
@@ -237,26 +233,43 @@ impl H264Encoder {
             )));
         }
 
-        let dpb_slot_count = requested_dpb_slots.min(max_dpb_slots_supported);
+        // Target number of active reference pictures.
+        // H.264 L0 list can theoretically handle more, but we clamp to config and device limits.
+        let mut target_active_refs = (config.max_reference_frames as usize)
+            .min(max_active_reference_pictures_supported)
+            .min(32);
 
-        let max_active_reference_pictures_supported =
-            capabilities.max_active_reference_pictures as usize;
-        if max_active_reference_pictures_supported < 1 {
-            return Err(PixelForgeError::NoSuitableDevice(format!(
-                "Device reports max_active_reference_pictures={} for this profile; need at least 1",
-                max_active_reference_pictures_supported
-            )));
+        // Ensure we have at least 1 active ref if supported.
+        if target_active_refs < 1 && max_active_reference_pictures_supported >= 1 {
+            target_active_refs = 1;
         }
 
+        // Calculate required DPB slots.
+        let requested_dpb_slots = if config.b_frame_count > 0 {
+            // For B-frames: Active Refs + B-frame buffer + Setup slot + Margin
+            target_active_refs + config.b_frame_count as usize + 2
+        } else {
+            // For P-frames: Active Refs + Setup slot
+            // We use target_active_refs + 1 (setup), and maybe +1 for safety if parallel operations occur.
+            target_active_refs + 1
+        };
+
+        let dpb_slot_count = requested_dpb_slots
+            .min(max_dpb_slots_supported)
+            .min(crate::encoder::dpb::MAX_DPB_SLOTS);
+
+        // Finalize active reference count based on what we actually allocated.
+        // We need at least 1 slot for the current setup frame.
         let max_active_reference_pictures =
-            (dpb_slot_count - 1).min(max_active_reference_pictures_supported);
+            target_active_refs.min(dpb_slot_count.saturating_sub(1)); // Ensure room for setup
 
         debug!(
-            "Allocating {} DPB slots (requested {}, device max {}), max_active_reference_pictures={} (device max {})",
+            "Allocating {} DPB slots (requested {}, device max {}), max_active_reference_pictures={} (target {}, device max {})",
             dpb_slot_count,
             requested_dpb_slots,
             max_dpb_slots_supported,
             max_active_reference_pictures,
+            target_active_refs,
             max_active_reference_pictures_supported
         );
 
@@ -449,7 +462,7 @@ impl H264Encoder {
             flags: pps_flags,
             seq_parameter_set_id: 0,
             pic_parameter_set_id: 0,
-            num_ref_idx_l0_default_active_minus1: 0, // Changed from 2 to 0
+            num_ref_idx_l0_default_active_minus1: (max_active_reference_pictures as i8 - 1).max(0) as u8,
             num_ref_idx_l1_default_active_minus1: 0,
             weighted_bipred_idc: ash::vk::native::StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_DEFAULT,
             pic_init_qp_minus26: -8,
@@ -627,7 +640,8 @@ impl H264Encoder {
             dpb_image_views,
             dpb_slot_count,
             current_dpb_slot: 0,
-            reference_dpb_slot: 1,
+            l0_references: Vec::new(),
+            active_reference_count: max_active_reference_pictures as u32,
             bitstream_buffer,
             bitstream_buffer_memory,
             bitstream_buffer_ptr,
@@ -638,9 +652,9 @@ impl H264Encoder {
             encode_fence,
             query_pool,
             sps_written: false,
-            has_reference: false,
-            reference_frame_num: 0,
-            reference_poc: 0,
+            // has_reference: false, // removed
+            // reference_frame_num: 0, // removed
+            // reference_poc: 0, // removed
             has_backward_reference: false,
             backward_reference_frame_num: 0,
             backward_reference_poc: 0,

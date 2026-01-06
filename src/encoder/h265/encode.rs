@@ -110,7 +110,7 @@ impl H265Encoder {
                 0, // dependent_slice_segment_flag
                 1, // slice_sao_luma_flag
                 1, // slice_sao_chroma_flag
-                0, // num_ref_idx_active_override_flag
+                1, // num_ref_idx_active_override_flag
                 0, // mvd_l1_zero_flag
                 0, // cabac_init_flag
                 0, // cu_chroma_qp_offset_enabled_flag
@@ -150,17 +150,23 @@ impl H265Encoder {
         let mut used_by_curr_pic_s0_flag: u16 = 0;
         let mut used_by_curr_pic_s1_flag: u16 = 0;
 
-        if !is_idr && self.has_reference {
-            // L0 reference (negative/past)
-            let delta_poc_l0 = self.reference_poc - pic_order_cnt;
-            delta_poc_s0_minus1[0] = (-delta_poc_l0 - 1).max(0) as u16;
-            num_negative_pics = 1;
-            used_by_curr_pic_s0_flag = 1; // First negative reference is used
+        if !is_idr && !self.l0_references.is_empty() {
+            // L0 references (negative/past)
+            let mut prev_delta_poc = 0;
 
-            debug!(
-                "H265 RPS: POC={}, L0 ref_poc={}, delta_poc_l0={}",
-                pic_order_cnt, self.reference_poc, delta_poc_l0
-            );
+            for (i, ref_info) in self.l0_references.iter().enumerate() {
+                if i >= 15 {
+                    break;
+                } // limit to 15 neg pics
+
+                let delta_poc = ref_info.poc - pic_order_cnt;
+                let diff = prev_delta_poc - delta_poc;
+                delta_poc_s0_minus1[num_negative_pics as usize] = (diff - 1).max(0) as u16;
+                prev_delta_poc = delta_poc;
+
+                used_by_curr_pic_s0_flag |= 1 << num_negative_pics;
+                num_negative_pics += 1;
+            }
 
             // For B-frames, add L1 reference (positive/future)
             if is_b_frame && self.has_backward_reference {
@@ -169,11 +175,6 @@ impl H265Encoder {
                 delta_poc_s1_minus1[0] = (delta_poc_l1 - 1).max(0) as u16;
                 num_positive_pics = 1;
                 used_by_curr_pic_s1_flag = 1; // First positive reference is used
-
-                debug!(
-                    "H265 RPS: L1 backward_ref_poc={}, delta_poc_l1={}",
-                    self.backward_reference_poc, delta_poc_l1
-                );
             }
         }
 
@@ -246,17 +247,29 @@ impl H265Encoder {
         let mut ref_list0: [u8; 15] = [NO_REFERENCE_PICTURE; 15];
         let mut ref_list1: [u8; 15] = [NO_REFERENCE_PICTURE; 15];
 
-        let (num_ref_l0, num_ref_l1) =
-            if is_b_frame && self.has_reference && self.has_backward_reference {
-                ref_list0[0] = self.reference_dpb_slot;
+        let (num_ref_l0, num_ref_l1) = if is_b_frame && self.has_backward_reference {
+            // B-frame logic
+            if let Some(first_ref) = self.l0_references.first() {
+                ref_list0[0] = first_ref.dpb_slot;
                 ref_list1[0] = self.backward_reference_dpb_slot;
                 (1, 1)
-            } else if !is_idr && self.has_reference {
-                ref_list0[0] = self.reference_dpb_slot;
-                (1, 0)
             } else {
                 (0, 0)
-            };
+            }
+        } else if !is_idr && !self.l0_references.is_empty() {
+            // P-frame logic
+            let count = self.l0_references.len();
+            for (i, ref_info) in self.l0_references.iter().enumerate() {
+                if i < 15 {
+                    ref_list0[i] = ref_info.dpb_slot;
+                }
+            }
+
+            // We use all available references as active
+            (count.min(15), 0)
+        } else {
+            (0, 0)
+        };
 
         let ref_lists_info_flags = ash::vk::native::StdVideoEncodeH265ReferenceListsInfoFlags {
             _bitfield_align_1: [],
@@ -291,14 +304,14 @@ impl H265Encoder {
             PicOrderCntVal: pic_order_cnt,
             TemporalId: 0,
             reserved1: [0; 7],
-            pRefLists: if !is_idr && self.has_reference {
+            pRefLists: if !is_idr && !self.l0_references.is_empty() {
                 &ref_lists_info
             } else {
                 std::ptr::null()
             },
             pShortTermRefPicSet: if is_idr {
                 &empty_rps
-            } else if self.has_reference {
+            } else if !self.l0_references.is_empty() {
                 &frame_rps
             } else {
                 &empty_rps
@@ -380,51 +393,45 @@ impl H265Encoder {
             (&mut h265_begin_dpb_slot_info as *mut vk::VideoEncodeH265DpbSlotInfoKHR).cast();
 
         // Set up reference slots.
-        let mut ref_slot_l0: vk::VideoReferenceSlotInfoKHR;
-        let mut ref_slot_l1: vk::VideoReferenceSlotInfoKHR;
-        let ref_resource_l0: vk::VideoPictureResourceInfoKHR;
-        let ref_resource_l1: vk::VideoPictureResourceInfoKHR;
-        let mut std_ref_l0_info: ash::vk::native::StdVideoEncodeH265ReferenceInfo;
-        let mut std_ref_l1_info: ash::vk::native::StdVideoEncodeH265ReferenceInfo;
-        let mut h265_ref_l0_dpb_slot_info: vk::VideoEncodeH265DpbSlotInfoKHR;
-        let mut h265_ref_l1_dpb_slot_info: vk::VideoEncodeH265DpbSlotInfoKHR;
 
-        let reference_slots_0: [vk::VideoReferenceSlotInfoKHR; 0];
-        let reference_slots_1: [vk::VideoReferenceSlotInfoKHR; 1];
-        let reference_slots_2: [vk::VideoReferenceSlotInfoKHR; 2];
-        let begin_slots_1: [vk::VideoReferenceSlotInfoKHR; 1];
-        let begin_slots_2: [vk::VideoReferenceSlotInfoKHR; 2];
-        let begin_slots_3: [vk::VideoReferenceSlotInfoKHR; 3];
+        // Storage vectors to keep data alive while pointers are used.
+        // We need capacity sufficient for all potential references (L0 + L1).
+        let mut ref_resources = Vec::with_capacity(16);
+        let mut std_ref_infos = Vec::with_capacity(16);
+        let mut h265_slot_infos = Vec::with_capacity(16);
 
-        let has_l0_ref = !is_idr && self.has_reference;
+        // Final slot lists
+        let mut reference_slots = Vec::with_capacity(16);
+        let mut reference_slots_for_begin = Vec::with_capacity(17); // +1 for setup slot
+        reference_slots_for_begin.push(setup_slot_for_begin);
+
+        let has_l0_ref = !is_idr && !self.l0_references.is_empty();
         let has_l1_ref = is_b_frame && self.has_backward_reference;
 
-        let (reference_slots, reference_slots_for_begin): (
-            &[vk::VideoReferenceSlotInfoKHR],
-            &[vk::VideoReferenceSlotInfoKHR],
-        ) = if has_l0_ref && has_l1_ref {
-            // B-frame with both L0 and L1 references.
-            ref_resource_l0 = vk::VideoPictureResourceInfoKHR::default()
-                .coded_offset(vk::Offset2D { x: 0, y: 0 })
-                .coded_extent(vk::Extent2D {
-                    width: self.aligned_width,
-                    height: self.aligned_height,
-                })
-                .base_array_layer(0)
-                .image_view_binding(self.dpb_image_views[self.reference_dpb_slot as usize]);
+        // Phase 1: Populate data storage (resources and std infos)
+        if has_l0_ref {
+            for ref_info in &self.l0_references {
+                let ref_resource = vk::VideoPictureResourceInfoKHR::default()
+                    .coded_offset(vk::Offset2D { x: 0, y: 0 })
+                    .coded_extent(vk::Extent2D {
+                        width: self.aligned_width,
+                        height: self.aligned_height,
+                    })
+                    .base_array_layer(0)
+                    .image_view_binding(self.dpb_image_views[ref_info.dpb_slot as usize]);
 
-            std_ref_l0_info = std_reference_info;
-            std_ref_l0_info.PicOrderCntVal = self.reference_poc;
-            std_ref_l0_info.pic_type = self.reference_pic_type;
-            h265_ref_l0_dpb_slot_info =
-                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&std_ref_l0_info);
-            ref_slot_l0 = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(self.reference_dpb_slot as i32)
-                .picture_resource(&ref_resource_l0);
-            ref_slot_l0.p_next =
-                (&mut h265_ref_l0_dpb_slot_info as *mut vk::VideoEncodeH265DpbSlotInfoKHR).cast();
+                ref_resources.push(ref_resource);
 
-            ref_resource_l1 = vk::VideoPictureResourceInfoKHR::default()
+                let mut std_info = std_reference_info;
+                std_info.PicOrderCntVal = ref_info.poc;
+                std_info.pic_type =
+                    ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P;
+                std_ref_infos.push(std_info);
+            }
+        }
+
+        if has_l1_ref {
+            let ref_resource = vk::VideoPictureResourceInfoKHR::default()
                 .coded_offset(vk::Offset2D { x: 0, y: 0 })
                 .coded_extent(vk::Extent2D {
                     width: self.aligned_width,
@@ -435,52 +442,58 @@ impl H265Encoder {
                     self.dpb_image_views[self.backward_reference_dpb_slot as usize],
                 );
 
-            std_ref_l1_info = std_reference_info;
-            std_ref_l1_info.PicOrderCntVal = self.backward_reference_poc;
-            std_ref_l1_info.pic_type =
+            ref_resources.push(ref_resource);
+
+            let mut std_info = std_reference_info;
+            std_info.PicOrderCntVal = self.backward_reference_poc;
+            std_info.pic_type =
                 ash::vk::native::StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P;
-            h265_ref_l1_dpb_slot_info =
-                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&std_ref_l1_info);
-            ref_slot_l1 = vk::VideoReferenceSlotInfoKHR::default()
+            std_ref_infos.push(std_info);
+        }
+
+        // Phase 2: Populate chain structs (referencing std_ref_infos)
+        for std_info in &std_ref_infos {
+            let h265_ref_slot_info =
+                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(std_info);
+            h265_slot_infos.push(h265_ref_slot_info);
+        }
+
+        // Phase 3: Populate reference slots (referencing ref_resources and h265_slot_infos)
+        // We know the mapping corresponds 1:1 by index because we pushed in the same order.
+        // Re-construct the list of DPB slots to assign correct slot_index.
+
+        let mut stored_indices_count = 0;
+        if has_l0_ref {
+            for ref_info in &self.l0_references {
+                let mut ref_slot = vk::VideoReferenceSlotInfoKHR::default()
+                    .slot_index(ref_info.dpb_slot as i32)
+                    .picture_resource(&ref_resources[stored_indices_count]);
+
+                ref_slot.p_next = (&mut h265_slot_infos[stored_indices_count]
+                    as *mut vk::VideoEncodeH265DpbSlotInfoKHR)
+                    .cast();
+
+                reference_slots.push(ref_slot);
+                reference_slots_for_begin.push(ref_slot);
+
+                stored_indices_count += 1;
+            }
+        }
+
+        if has_l1_ref {
+            let mut ref_slot = vk::VideoReferenceSlotInfoKHR::default()
                 .slot_index(self.backward_reference_dpb_slot as i32)
-                .picture_resource(&ref_resource_l1);
-            ref_slot_l1.p_next =
-                (&mut h265_ref_l1_dpb_slot_info as *mut vk::VideoEncodeH265DpbSlotInfoKHR).cast();
+                .picture_resource(&ref_resources[stored_indices_count]);
 
-            reference_slots_2 = [ref_slot_l0, ref_slot_l1];
-            begin_slots_3 = [setup_slot_for_begin, ref_slot_l0, ref_slot_l1];
-            (&reference_slots_2, &begin_slots_3)
-        } else if has_l0_ref {
-            // P-frame with only L0 reference.
-            ref_resource_l0 = vk::VideoPictureResourceInfoKHR::default()
-                .coded_offset(vk::Offset2D { x: 0, y: 0 })
-                .coded_extent(vk::Extent2D {
-                    width: self.aligned_width,
-                    height: self.aligned_height,
-                })
-                .base_array_layer(0)
-                .image_view_binding(self.dpb_image_views[self.reference_dpb_slot as usize]);
+            ref_slot.p_next = (&mut h265_slot_infos[stored_indices_count]
+                as *mut vk::VideoEncodeH265DpbSlotInfoKHR)
+                .cast();
 
-            std_ref_l0_info = std_reference_info;
-            std_ref_l0_info.PicOrderCntVal = self.reference_poc;
-            std_ref_l0_info.pic_type = self.reference_pic_type;
-            h265_ref_l0_dpb_slot_info =
-                vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&std_ref_l0_info);
-            ref_slot_l0 = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(self.reference_dpb_slot as i32)
-                .picture_resource(&ref_resource_l0);
-            ref_slot_l0.p_next =
-                (&mut h265_ref_l0_dpb_slot_info as *mut vk::VideoEncodeH265DpbSlotInfoKHR).cast();
+            reference_slots.push(ref_slot);
+            reference_slots_for_begin.push(ref_slot);
 
-            reference_slots_1 = [ref_slot_l0];
-            begin_slots_2 = [setup_slot_for_begin, ref_slot_l0];
-            (&reference_slots_1, &begin_slots_2)
-        } else {
-            // I/IDR frame with no references.
-            reference_slots_0 = [];
-            begin_slots_1 = [setup_slot_for_begin];
-            (&reference_slots_0, &begin_slots_1)
-        };
+            // stored_indices_count += 1; // Not needed anymore
+        }
 
         // Rate control setup.
         let (rc_mode, average_bitrate, max_bitrate, qp) = match self.config.rate_control_mode {
@@ -564,12 +577,12 @@ impl H265Encoder {
             vk::VideoBeginCodingInfoKHR::default()
                 .video_session(self.session)
                 .video_session_parameters(self.session_params)
-                .reference_slots(reference_slots_for_begin)
+                .reference_slots(&reference_slots_for_begin)
         } else {
             let mut info = vk::VideoBeginCodingInfoKHR::default()
                 .video_session(self.session)
                 .video_session_parameters(self.session_params)
-                .reference_slots(reference_slots_for_begin);
+                .reference_slots(&reference_slots_for_begin);
             info.p_next = (&mut rc_info as *mut vk::VideoEncodeRateControlInfoKHR).cast();
             info
         };
@@ -609,7 +622,7 @@ impl H265Encoder {
             .flags(vk::VideoEncodeFlagsKHR::empty())
             .src_picture_resource(src_picture_resource)
             .setup_reference_slot(&setup_slot_info)
-            .reference_slots(reference_slots)
+            .reference_slots(&reference_slots)
             .dst_buffer(self.bitstream_buffer)
             .dst_buffer_offset(0)
             .dst_buffer_range(MIN_BITSTREAM_BUFFER_SIZE as u64);
@@ -691,11 +704,10 @@ impl H265Encoder {
         })?;
 
         debug!(
-            "Submitting frame {} to GPU: idr={}, has_ref={}, ref_slot={}, cur_slot={}",
+            "Submitting frame {} to GPU: idr={}, num_refs={}, cur_slot={}",
             self.encode_frame_num,
             is_idr,
-            self.has_reference,
-            self.reference_dpb_slot,
+            self.l0_references.len(),
             self.current_dpb_slot
         );
 
