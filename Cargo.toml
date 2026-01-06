@@ -22,15 +22,3 @@ shaderc = "0.8"
 [dev-dependencies]
 env_logger = "0.11"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-
-[[example]]
-name = "query_capabilities"
-path = "examples/query_capabilities.rs"
-
-[[example]]
-name = "encode_h264"
-path = "examples/encode_h264.rs"
-
-[[example]]
-name = "encode_h265"
-path = "examples/encode_h265.rs"
