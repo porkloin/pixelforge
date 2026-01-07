@@ -356,7 +356,7 @@ impl H265Encoder {
             sps_seq_parameter_set_id: 0,
             bit_depth_luma_minus8: bit_depth_minus8,
             bit_depth_chroma_minus8: bit_depth_minus8,
-            log2_max_pic_order_cnt_lsb_minus4: 4, // POC LSB range = 256
+            log2_max_pic_order_cnt_lsb_minus4: 4, // POC LSB range = 256 (wraps every ~4s at 60fps)
             log2_min_luma_coding_block_size_minus3: min_cb_log2_size_y - 3,
             log2_diff_max_min_luma_coding_block_size: ctb_log2_size_y - min_cb_log2_size_y,
             log2_min_luma_transform_block_size_minus2: log2_min_transform_block_size - 2,

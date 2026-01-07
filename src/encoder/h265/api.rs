@@ -55,16 +55,30 @@ impl H265Encoder {
         let is_idr = gop_position.frame_type.is_idr();
         let is_reference = gop_position.is_reference;
         let is_b_frame = gop_position.frame_type == GopFrameType::B;
-        let frame_type = match gop_position.frame_type {
-            GopFrameType::Idr | GopFrameType::I => crate::encoder::FrameType::I,
-            GopFrameType::P => crate::encoder::FrameType::P,
-            GopFrameType::B => crate::encoder::FrameType::B,
-        };
 
         debug!(
-            "Encoding frame: display_order={}, type={:?}, idr={}, ref={}",
-            display_order, frame_type, is_idr, is_reference
+            "Encoding frame: display_order={}, type={:?}, idr={}, ref={}, poc={}, l0_refs={:?}",
+            display_order,
+            gop_position.frame_type,
+            is_idr,
+            is_reference,
+            gop_position.pic_order_cnt,
+            self.l0_references
+                .iter()
+                .map(|r| (r.dpb_slot, r.poc))
+                .collect::<Vec<_>>()
         );
+
+        // Determine frame_type.
+        let frame_type = if is_idr {
+            crate::encoder::FrameType::I
+        } else {
+            match gop_position.frame_type {
+                GopFrameType::Idr | GopFrameType::I => crate::encoder::FrameType::I,
+                GopFrameType::P => crate::encoder::FrameType::P,
+                GopFrameType::B => crate::encoder::FrameType::B,
+            }
+        };
 
         if is_idr {
             // Reset DPB by calling sequence_start with new config for IDR.

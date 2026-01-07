@@ -114,7 +114,9 @@ pub fn create_converter(
         device,
         context.memory_properties(),
         output_size as vk::DeviceSize,
-        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
 
@@ -145,9 +147,9 @@ pub fn create_converter(
 
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-    // Create command pool for transfer queue.
+    // Create command pool for compute queue.
     let pool_info = vk::CommandPoolCreateInfo::default()
-        .queue_family_index(context.transfer_queue_family())
+        .queue_family_index(context.compute_queue_family())
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
 
     let command_pool = unsafe { device.create_command_pool(&pool_info, None) }

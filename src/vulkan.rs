@@ -77,6 +77,8 @@ struct VideoContextInner {
     video_encode_queue: Option<vk::Queue>,
     transfer_queue_family: u32,
     transfer_queue: vk::Queue,
+    compute_queue_family: u32,
+    compute_queue: vk::Queue,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     device_properties: vk::PhysicalDeviceProperties,
     supported_encode_codecs: Vec<Codec>,
@@ -127,6 +129,16 @@ impl VideoContext {
     /// Get the transfer queue.
     pub fn transfer_queue(&self) -> vk::Queue {
         self.inner.transfer_queue
+    }
+
+    /// Get the compute queue family index.
+    pub fn compute_queue_family(&self) -> u32 {
+        self.inner.compute_queue_family
+    }
+
+    /// Get the compute queue.
+    pub fn compute_queue(&self) -> vk::Queue {
+        self.inner.compute_queue
     }
 
     pub(crate) fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
@@ -203,6 +215,7 @@ impl VideoContext {
         let mut selected_device = None;
         let mut video_encode_queue_family = None;
         let mut transfer_queue_family = u32::MAX;
+        let mut compute_queue_family = u32::MAX;
         let mut supported_encode_codecs = Vec::new();
 
         for physical_device in physical_devices {
@@ -218,6 +231,7 @@ impl VideoContext {
             // Find queue families.
             let mut encode_queue = None;
             let mut transfer_q = u32::MAX;
+            let mut compute_q = u32::MAX;
 
             for (idx, props) in queue_families.iter().enumerate() {
                 debug!(
@@ -234,6 +248,12 @@ impl VideoContext {
                 // Check for transfer queue.
                 if props.queue_flags.contains(vk::QueueFlags::TRANSFER) {
                     transfer_q = idx as u32;
+                }
+
+                // Check for compute queue (prefer dedicated compute, otherwise graphics+compute).
+                if props.queue_flags.contains(vk::QueueFlags::COMPUTE) && compute_q == u32::MAX {
+                    compute_q = idx as u32;
+                    debug!("Found compute queue at family {}", idx);
                 }
             }
 
@@ -256,10 +276,11 @@ impl VideoContext {
                 .iter()
                 .all(|codec| encode_codecs.contains(codec));
 
-            // We need encode support.
+            // We need encode support and compute support.
             let has_video_support = encode_queue.is_some();
+            let has_compute_support = compute_q != u32::MAX;
 
-            if has_video_support && encode_supported {
+            if has_video_support && encode_supported && has_compute_support {
                 selected_device = Some(physical_device);
                 video_encode_queue_family = encode_queue;
                 transfer_queue_family = if transfer_q != u32::MAX {
@@ -267,6 +288,7 @@ impl VideoContext {
                 } else {
                     encode_queue.unwrap_or(0)
                 };
+                compute_queue_family = compute_q;
                 supported_encode_codecs = encode_codecs;
                 info!("Selected device: {}", device_name);
                 break;
@@ -294,6 +316,9 @@ impl VideoContext {
         }
         if !unique_families.contains(&transfer_queue_family) {
             unique_families.push(transfer_queue_family);
+        }
+        if !unique_families.contains(&compute_queue_family) {
+            unique_families.push(compute_queue_family);
         }
 
         let queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = unique_families
@@ -374,11 +399,13 @@ impl VideoContext {
         let video_encode_queue =
             video_encode_queue_family.map(|family| unsafe { device.get_device_queue(family, 0) });
         let transfer_queue = unsafe { device.get_device_queue(transfer_queue_family, 0) };
+        let compute_queue = unsafe { device.get_device_queue(compute_queue_family, 0) };
 
         if let Some(family) = video_encode_queue_family {
             info!("Video encode queue family: {}", family);
         }
         info!("Transfer queue family: {}", transfer_queue_family);
+        info!("Compute queue family: {}", compute_queue_family);
         info!("Created Vulkan device with video support");
 
         Ok(Self {
@@ -391,6 +418,8 @@ impl VideoContext {
                 video_encode_queue,
                 transfer_queue_family,
                 transfer_queue,
+                compute_queue_family,
+                compute_queue,
                 memory_properties,
                 device_properties,
                 supported_encode_codecs,

@@ -12,6 +12,7 @@ mod shader;
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
+use tracing::debug;
 
 /// Supported input pixel formats for color conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,12 +38,16 @@ impl InputFormat {
 /// Supported output YUV formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// NV12: Y plane followed by interleaved UV (4:2:0).
+    /// NV12: Y plane followed by interleaved UV (4:2:0), 8-bit.
     NV12,
-    /// I420: Y plane, U plane, V plane (4:2:0).
+    /// I420: Y plane, U plane, V plane (4:2:0), 8-bit.
     I420,
-    /// YUV444: Full resolution Y, U, V planes.
+    /// YUV444: Full resolution Y, U, V planes, 8-bit.
     YUV444,
+    /// P010: Y plane followed by interleaved UV (4:2:0), 10-bit in 16-bit words.
+    P010,
+    /// YUV444 10-bit: Full resolution Y, U, V in 16-bit words.
+    YUV444P10,
 }
 
 impl OutputFormat {
@@ -52,6 +57,9 @@ impl OutputFormat {
         match self {
             OutputFormat::NV12 | OutputFormat::I420 => pixel_count * 3 / 2,
             OutputFormat::YUV444 => pixel_count * 3,
+            // 10-bit formats use 2 bytes per sample.
+            OutputFormat::P010 => pixel_count * 3, // Y (2 bytes) + UV (1 byte each, half res)
+            OutputFormat::YUV444P10 => pixel_count * 6, // Y + U + V, each 2 bytes.
         }
     }
 
@@ -61,6 +69,22 @@ impl OutputFormat {
             OutputFormat::NV12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
             OutputFormat::I420 => vk::Format::G8_B8_R8_3PLANE_420_UNORM,
             OutputFormat::YUV444 => vk::Format::G8_B8_R8_3PLANE_444_UNORM,
+            OutputFormat::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+            OutputFormat::YUV444P10 => vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16,
+        }
+    }
+
+    /// Returns true if this is a 10-bit format.
+    pub fn is_10bit(&self) -> bool {
+        matches!(self, OutputFormat::P010 | OutputFormat::YUV444P10)
+    }
+
+    /// Bytes per sample for this format.
+    pub fn bytes_per_sample(&self) -> usize {
+        if self.is_10bit() {
+            2
+        } else {
+            1
         }
     }
 }
@@ -297,6 +321,93 @@ impl ColorConverter {
                     },
                 ]
             }
+            OutputFormat::P010 => {
+                // P010: 10-bit NV12 with 16-bit samples.
+                // Y plane: full resolution, 2 bytes per sample.
+                // UV plane: half resolution, interleaved, 2 bytes per component.
+                let y_size = (self.config.width * self.config.height * 2) as u64;
+                vec![
+                    // Y plane (16-bit samples).
+                    vk::BufferImageCopy {
+                        buffer_offset: 0,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::PLANE_0,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                        image_extent: vk::Extent3D {
+                            width: self.config.width,
+                            height: self.config.height,
+                            depth: 1,
+                        },
+                    },
+                    // UV plane (interleaved, half resolution, 16-bit per component).
+                    vk::BufferImageCopy {
+                        buffer_offset: y_size,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::PLANE_1,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                        image_extent: vk::Extent3D {
+                            width: self.config.width / 2,
+                            height: self.config.height / 2,
+                            depth: 1,
+                        },
+                    },
+                ]
+            }
+            OutputFormat::YUV444P10 => {
+                // YUV444 10-bit: 2-plane format (Y plane, UV interleaved).
+                // Note: Using 2-plane format as that's what the encoder expects.
+                let y_size = (self.config.width * self.config.height * 2) as u64;
+                vec![
+                    // Y plane (16-bit samples).
+                    vk::BufferImageCopy {
+                        buffer_offset: 0,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::PLANE_0,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                        image_extent: vk::Extent3D {
+                            width: self.config.width,
+                            height: self.config.height,
+                            depth: 1,
+                        },
+                    },
+                    // UV plane (interleaved, full resolution, 16-bit per component).
+                    vk::BufferImageCopy {
+                        buffer_offset: y_size,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::PLANE_1,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                        image_extent: vk::Extent3D {
+                            width: self.config.width,
+                            height: self.config.height,
+                            depth: 1,
+                        },
+                    },
+                ]
+            }
         }
     }
 
@@ -321,6 +432,7 @@ impl ColorConverter {
     /// Returns `Ok(())` on success. The target_image is transitioned to VIDEO_ENCODE_SRC_KHR.
     pub fn convert(&mut self, src_image: vk::Image, target_image: vk::Image) -> Result<()> {
         let device = self.context.device();
+        let start = std::time::Instant::now();
 
         // Reset and record command buffer.
         unsafe {
@@ -594,13 +706,16 @@ impl ColorConverter {
             let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
 
             device
-                .queue_submit(self.context.transfer_queue(), &[submit_info], self.fence)
+                .queue_submit(self.context.compute_queue(), &[submit_info], self.fence)
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
             device
                 .wait_for_fences(&[self.fence], true, u64::MAX)
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
         }
+
+        let elapsed = start.elapsed();
+        debug!("ColorConverter::convert() took {:?}", elapsed);
 
         Ok(())
     }

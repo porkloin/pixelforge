@@ -153,7 +153,7 @@ layout(push_constant) uniform PushConstants {
     uint width;
     uint height;
     uint input_format;   // 0=BGRx, 1=RGBx, 2=BGRA, 3=RGBA
-    uint output_format;  // 0=NV12, 1=I420, 2=YUV444
+    uint output_format;  // 0=NV12, 1=I420, 2=YUV444, 3=P010, 4=YUV444P10
 } params;
 
 layout(std430, binding = 0) readonly buffer InputBuffer {
@@ -196,6 +196,13 @@ vec3 rgb_to_yuv(vec3 rgb) {
     return vec3(clamp(y, 0.0, 255.0), clamp(u, 0.0, 255.0), clamp(v, 0.0, 255.0));
 }
 
+// Convert 8-bit value to 10-bit in 16-bit word (value in upper 10 bits).
+uint to_10bit(float val) {
+    // Scale from 0-255 to 0-1023 (10-bit range), then shift left by 6.
+    uint val10 = uint(val * 4.0);  // 0-255 -> 0-1020, close to 0-1023.
+    return (val10 << 6u) & 0xFFC0u;  // Mask to ensure upper 10 bits only.
+}
+
 void main() {
     uint x = gl_GlobalInvocationID.x;
     uint y = gl_GlobalInvocationID.y;
@@ -210,7 +217,7 @@ void main() {
     uint pixel_count = params.width * params.height;
 
     if (params.output_format == 2u) {
-        // YUV444: Full resolution, byte-packed into uints.
+        // YUV444 8-bit: Full resolution, byte-packed into uints.
         // Each pixel writes one byte to Y, U, and V planes.
         uint y_byte_idx = pixel_idx;
         uint y_word_idx = y_byte_idx / 4u;
@@ -228,8 +235,60 @@ void main() {
         uint v_word_idx = v_byte_idx / 4u;
         uint v_byte_offset = v_byte_idx % 4u;
         atomicOr(output_data[v_word_idx], uint(yuv.z) << (v_byte_offset * 8u));
+    } else if (params.output_format == 4u) {
+        // YUV444P10 (10-bit): 2-plane semi-planar format.
+        // Y plane: 16-bit per sample, full resolution.
+        // UV plane: 16-bit per component, interleaved, full resolution.
+        uint y_word_idx = pixel_idx;  // One 16-bit value per pixel, packed 2 per uint.
+        uint y_half_offset = pixel_idx % 2u;
+        uint y_packed_idx = pixel_idx / 2u;
+        atomicOr(output_data[y_packed_idx], to_10bit(yuv.x) << (y_half_offset * 16u));
+
+        // UV plane starts after Y plane (pixel_count 16-bit values = pixel_count/2 uints).
+        uint uv_base_words = pixel_count / 2u;
+        // Each pixel has one UV pair (2x 16-bit = 32-bit = one uint).
+        uint uv_word_idx = uv_base_words + pixel_idx;
+        uint uv_packed = to_10bit(yuv.y) | (to_10bit(yuv.z) << 16u);
+        output_data[uv_word_idx] = uv_packed;
+    } else if (params.output_format == 3u) {
+        // P010 (10-bit NV12): 2-plane semi-planar, 4:2:0 subsampling.
+        // Y plane: 16-bit per sample.
+        uint y_half_offset = pixel_idx % 2u;
+        uint y_packed_idx = pixel_idx / 2u;
+        atomicOr(output_data[y_packed_idx], to_10bit(yuv.x) << (y_half_offset * 16u));
+
+        // Only process UV for top-left pixel of each 2x2 block.
+        if ((x % 2u == 0u) && (y % 2u == 0u)) {
+            uint uv_x = x / 2u;
+            uint uv_y = y / 2u;
+            uint uv_width = params.width / 2u;
+            uint uv_idx = uv_y * uv_width + uv_x;
+
+            // Sample all 4 pixels in the 2x2 block for proper UV averaging.
+            vec3 yuv00 = yuv;
+            uint idx10 = pixel_idx + 1u;
+            uint idx01 = pixel_idx + params.width;
+            uint idx11 = pixel_idx + params.width + 1u;
+
+            vec3 yuv10 = (x + 1u < params.width) ?
+                rgb_to_yuv(extract_rgb(input_data[idx10], params.input_format)) : yuv00;
+            vec3 yuv01 = (y + 1u < params.height) ?
+                rgb_to_yuv(extract_rgb(input_data[idx01], params.input_format)) : yuv00;
+            vec3 yuv11 = (x + 1u < params.width && y + 1u < params.height) ?
+                rgb_to_yuv(extract_rgb(input_data[idx11], params.input_format)) : yuv00;
+
+            float avg_u = (yuv00.y + yuv10.y + yuv01.y + yuv11.y) / 4.0;
+            float avg_v = (yuv00.z + yuv10.z + yuv01.z + yuv11.z) / 4.0;
+
+            // UV plane starts after Y plane (pixel_count 16-bit values = pixel_count/2 uints).
+            uint uv_base_words = pixel_count / 2u;
+            // Each UV pair is one uint (U 16-bit, V 16-bit).
+            uint uv_word_idx = uv_base_words + uv_idx;
+            uint uv_packed = to_10bit(avg_u) | (to_10bit(avg_v) << 16u);
+            output_data[uv_word_idx] = uv_packed;
+        }
     } else {
-        // YUV420: Write Y for every pixel.
+        // YUV420 8-bit (NV12 or I420): Write Y for every pixel.
         uint y_byte_idx = pixel_idx;
         uint y_word_idx = y_byte_idx / 4u;
         uint y_byte_offset = y_byte_idx % 4u;

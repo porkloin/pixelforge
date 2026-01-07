@@ -152,6 +152,10 @@ impl H265Encoder {
 
         if !is_idr && !self.l0_references.is_empty() {
             // L0 references (negative/past)
+            // Calculate max_poc from config (2^(log2_max_pic_order_cnt_lsb_minus4 + 4) * 2).
+            // With log2_max_pic_order_cnt_lsb_minus4 = 4, max_poc = 2^8 * 2 = 512.
+            let max_poc = 1i32 << 9; // 512
+
             let mut prev_delta_poc = 0;
 
             for (i, ref_info) in self.l0_references.iter().enumerate() {
@@ -159,7 +163,17 @@ impl H265Encoder {
                     break;
                 } // limit to 15 neg pics
 
-                let delta_poc = ref_info.poc - pic_order_cnt;
+                // Calculate delta POC with wraparound handling.
+                // delta_poc should be negative (reference is in the past).
+                let mut delta_poc = ref_info.poc - pic_order_cnt;
+                // If delta_poc is positive and large, it means POC wrapped around.
+                // Adjust by subtracting max_poc to get the correct negative delta.
+                if delta_poc > max_poc / 2 {
+                    delta_poc -= max_poc;
+                } else if delta_poc < -max_poc / 2 {
+                    delta_poc += max_poc;
+                }
+
                 let diff = prev_delta_poc - delta_poc;
                 delta_poc_s0_minus1[num_negative_pics as usize] = (diff - 1).max(0) as u16;
                 prev_delta_poc = delta_poc;
@@ -711,6 +725,8 @@ impl H265Encoder {
             self.current_dpb_slot
         );
 
+        let gpu_start = std::time::Instant::now();
+
         unsafe {
             self.context
                 .device()
@@ -725,6 +741,9 @@ impl H265Encoder {
                 .wait_for_fences(&[self.encode_fence], true, u64::MAX)
         }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+        let gpu_elapsed = gpu_start.elapsed();
+        debug!("GPU encode took {:?}", gpu_elapsed);
 
         unsafe { self.context.device().reset_fences(&[self.encode_fence]) }
             .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
