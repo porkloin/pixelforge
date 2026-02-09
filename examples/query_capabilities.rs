@@ -5,7 +5,6 @@
 
 use ash::vk;
 use pixelforge::{Codec, VideoContextBuilder};
-use std::ffi::CStr;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PixelForge Codec Capabilities Example");
