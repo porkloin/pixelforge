@@ -15,10 +15,10 @@ pub fn create_converter(
 
     // Create descriptor set layout.
     let bindings = [
-        // Binding 0: Input buffer (RGB/BGR)
+        // Binding 0: Source image sampler (replaces the old input buffer).
         vk::DescriptorSetLayoutBinding::default()
             .binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
         // Binding 1: Output buffer (YUV)
@@ -74,11 +74,17 @@ pub fn create_converter(
     unsafe { device.destroy_shader_module(shader_module, None) };
 
     // Create descriptor pool.
-    let pool_sizes = [vk::DescriptorPoolSize::default()
-        .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(2)];
+    let pool_sizes = [
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1),
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1),
+    ];
 
     let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
         .max_sets(1)
         .pool_sizes(&pool_sizes);
 
@@ -93,21 +99,22 @@ pub fn create_converter(
     let descriptor_set = unsafe { device.allocate_descriptor_sets(&alloc_info) }
         .map_err(|e| PixelForgeError::ResourceCreation(e.to_string()))?[0];
 
-    // Calculate buffer sizes.
-    let input_size =
-        (config.width * config.height) as usize * config.input_format.bytes_per_pixel();
+    // Calculate output buffer size.
     let output_size = config
         .output_format
         .output_size(config.width, config.height);
 
-    // Create input buffer (host visible for upload, transfer dst for image-to-buffer copy)
-    let (input_buffer, input_memory) = create_buffer(
-        device,
-        context.memory_properties(),
-        input_size as vk::DeviceSize,
-        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )?;
+    // Create a nearest-neighbor sampler for texelFetch (the sampler state doesn't
+    // matter for texelFetch, but Vulkan requires a valid one for combined image sampler).
+    let sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::NEAREST)
+        .min_filter(vk::Filter::NEAREST)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+
+    let sampler = unsafe { device.create_sampler(&sampler_info, None) }
+        .map_err(|e| PixelForgeError::ResourceCreation(format!("sampler creation: {}", e)))?;
 
     // Create output buffer (device local for compute shader output, transfer source for image copy)
     let (output_buffer, output_memory) = create_buffer(
@@ -120,30 +127,18 @@ pub fn create_converter(
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
 
-    // Update descriptor set with buffer bindings.
-    let buffer_infos = [
-        vk::DescriptorBufferInfo::default()
-            .buffer(input_buffer)
-            .offset(0)
-            .range(input_size as vk::DeviceSize),
-        vk::DescriptorBufferInfo::default()
-            .buffer(output_buffer)
-            .offset(0)
-            .range(output_size as vk::DeviceSize),
-    ];
+    // Write only the output buffer descriptor now; the source image descriptor
+    // is written per-frame in convert() when we know the actual source ImageView.
+    let output_buffer_info = vk::DescriptorBufferInfo::default()
+        .buffer(output_buffer)
+        .offset(0)
+        .range(output_size as vk::DeviceSize);
 
-    let writes = [
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_infos[0])),
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&buffer_infos[1])),
-    ];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(descriptor_set)
+        .dst_binding(1)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(std::slice::from_ref(&output_buffer_info))];
 
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 
@@ -177,8 +172,8 @@ pub fn create_converter(
         pipeline,
         descriptor_pool,
         descriptor_set,
-        input_buffer,
-        input_memory,
+        sampler,
+        cached_src_view: None,
         output_buffer,
         output_memory,
         command_pool,

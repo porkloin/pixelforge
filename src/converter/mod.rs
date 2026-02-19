@@ -117,9 +117,11 @@ pub struct ColorConverter {
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
 
-    // Input buffer (host-visible for upload)
-    input_buffer: vk::Buffer,
-    input_memory: vk::DeviceMemory,
+    // Sampler for texelFetch on the source image.
+    sampler: vk::Sampler,
+
+    // Cached ImageView for the source image (avoids per-frame recreation).
+    cached_src_view: Option<(vk::Image, vk::ImageView)>,
 
     // Output buffer (compute shader writes here)
     output_buffer: vk::Buffer,
@@ -431,8 +433,27 @@ impl ColorConverter {
     /// # Returns
     /// Returns `Ok(())` on success. The target_image is transitioned to VIDEO_ENCODE_SRC_KHR.
     pub fn convert(&mut self, src_image: vk::Image, target_image: vk::Image) -> Result<()> {
-        let device = self.context.device();
         let start = std::time::Instant::now();
+
+        // Get or create ImageView for the source image (must happen before
+        // borrowing device immutably, since this takes &mut self).
+        let src_view = self.get_or_create_src_view(src_image)?;
+
+        let device = self.context.device();
+
+        // Update descriptor set binding 0 with the source image view.
+        let image_info = vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(src_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&image_info));
+
+        unsafe { device.update_descriptor_sets(&[write], &[]) };
 
         // Reset and record command buffer.
         unsafe {
@@ -447,12 +468,11 @@ impl ColorConverter {
                 .begin_command_buffer(self.command_buffer, &begin_info)
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-            // --- Phase 1: Copy source image to input buffer ---
+            // --- Phase 1: Transition source image for shader read ---
 
-            // Transition source image to TRANSFER_SRC_OPTIMAL.
             let src_barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL) // DMA-BUF imported images are typically GENERAL
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(src_image)
@@ -464,67 +484,21 @@ impl ColorConverter {
                     layer_count: 1,
                 })
                 .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
 
             device.cmd_pipeline_barrier(
                 self.command_buffer,
                 vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
                 &[src_barrier],
             );
 
-            // Copy image to buffer.
-            let region = vk::BufferImageCopy {
-                buffer_offset: 0,
-                buffer_row_length: 0,   // Tightly packed
-                buffer_image_height: 0, // Tightly packed
-                image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                image_extent: vk::Extent3D {
-                    width: self.config.width,
-                    height: self.config.height,
-                    depth: 1,
-                },
-            };
-
-            device.cmd_copy_image_to_buffer(
-                self.command_buffer,
-                src_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.input_buffer,
-                &[region],
-            );
-
-            // Memory barrier: ensure buffer write is complete before compute shader reads it.
-            let input_buffer_barrier = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .buffer(self.input_buffer)
-                .size(vk::WHOLE_SIZE);
-
-            device.cmd_pipeline_barrier(
-                self.command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[input_buffer_barrier],
-                &[],
-            );
-
-            // --- Phase 2: Run compute shader ---
+            // --- Phase 2: Run compute shader (reads source image directly) ---
 
             // Clear output buffer to zero before compute shader runs.
-            // This is CRITICAL because the shader uses atomicOr to write values,
-            // which would accumulate if the buffer isn't cleared between frames.
             let output_size = self
                 .config
                 .output_format
@@ -664,9 +638,9 @@ impl ColorConverter {
                     layer_count: 1,
                 });
 
-            // Also transition source image back to GENERAL for reuse.
+            // Transition source image back to GENERAL for reuse.
             let src_barrier_back = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .new_layout(vk::ImageLayout::GENERAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -678,12 +652,12 @@ impl ColorConverter {
                     base_array_layer: 0,
                     layer_count: 1,
                 })
-                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
                 .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
 
             device.cmd_pipeline_barrier(
                 self.command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -719,6 +693,39 @@ impl ColorConverter {
 
         Ok(())
     }
+
+    /// Get or create an ImageView for the source image.
+    fn get_or_create_src_view(&mut self, src_image: vk::Image) -> Result<vk::ImageView> {
+        // Return cached view if it matches the current source image.
+        if let Some((cached_image, cached_view)) = self.cached_src_view {
+            if cached_image == src_image {
+                return Ok(cached_view);
+            }
+            // Different image — destroy the old view.
+            unsafe {
+                self.context.device().destroy_image_view(cached_view, None);
+            }
+        }
+
+        // Create a new ImageView for the source image.
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(src_image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+
+        let view = unsafe { self.context.device().create_image_view(&view_info, None) }
+            .map_err(|e| PixelForgeError::ResourceCreation(format!("source image view: {}", e)))?;
+
+        self.cached_src_view = Some((src_image, view));
+        Ok(view)
+    }
 }
 
 impl Drop for ColorConverter {
@@ -726,9 +733,15 @@ impl Drop for ColorConverter {
         unsafe {
             let device = self.context.device();
 
-            // Destroy buffers and their memory.
-            device.destroy_buffer(self.input_buffer, None);
-            device.free_memory(self.input_memory, None);
+            // Destroy cached source image view.
+            if let Some((_, view)) = self.cached_src_view.take() {
+                device.destroy_image_view(view, None);
+            }
+
+            // Destroy sampler.
+            device.destroy_sampler(self.sampler, None);
+
+            // Destroy output buffer and its memory.
             device.destroy_buffer(self.output_buffer, None);
             device.free_memory(self.output_memory, None);
 
