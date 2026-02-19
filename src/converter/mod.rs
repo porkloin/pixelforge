@@ -428,11 +428,18 @@ impl ColorConverter {
     ///
     /// # Arguments
     /// * `src_image` - Source RGB/BGR image (e.g., from DMA-BUF import)
+    /// * `src_layout` - Current layout of the source image (e.g., `GENERAL` for cached
+    ///   imports, `UNDEFINED` for first-time imports that haven't been transitioned yet)
     /// * `target_image` - Target image to write YUV data to (e.g., encoder's input_image)
     ///
     /// # Returns
     /// Returns `Ok(())` on success. The target_image is transitioned to VIDEO_ENCODE_SRC_KHR.
-    pub fn convert(&mut self, src_image: vk::Image, target_image: vk::Image) -> Result<()> {
+    pub fn convert(
+        &mut self,
+        src_image: vk::Image,
+        src_layout: vk::ImageLayout,
+        target_image: vk::Image,
+    ) -> Result<()> {
         let start = std::time::Instant::now();
 
         // Get or create ImageView for the source image (must happen before
@@ -471,7 +478,7 @@ impl ColorConverter {
             // --- Phase 1: Transition source image for shader read ---
 
             let src_barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
+                .old_layout(src_layout)
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
