@@ -26,9 +26,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // Ensure test data exists
-    ensure_test_data("yuv420p", "testdata/test_frames_yuv420p.yuv")?;
-    ensure_test_data("yuv444p", "testdata/test_frames_yuv444p.yuv")?;
+    // Ensure test data exists (dimensions encoded in filename to avoid stale data
+    // when switching between branches with different WIDTH/HEIGHT constants).
+    let yuv420_path = format!("testdata/test_frames_{}x{}_yuv420p.yuv", WIDTH, HEIGHT);
+    let yuv444_path = format!("testdata/test_frames_{}x{}_yuv444p.yuv", WIDTH, HEIGHT);
+    ensure_test_data("yuv420p", &yuv420_path)?;
+    ensure_test_data("yuv444p", &yuv444_path)?;
 
     let combinations = [
         (Codec::H264, EncodeBitDepth::Eight, PixelFormat::Yuv420),
@@ -132,13 +135,13 @@ fn run_test(
             InputImage::new(context.clone(), codec, WIDTH, HEIGHT, depth, format)?;
 
         let input_path = match format {
-            PixelFormat::Yuv420 => "testdata/test_frames_yuv420p.yuv",
-            PixelFormat::Yuv444 => "testdata/test_frames_yuv444p.yuv",
+            PixelFormat::Yuv420 => format!("testdata/test_frames_{}x{}_yuv420p.yuv", WIDTH, HEIGHT),
+            PixelFormat::Yuv444 => format!("testdata/test_frames_{}x{}_yuv444p.yuv", WIDTH, HEIGHT),
             _ => return Err("Unsupported format".into()),
         };
 
         let mut yuv_data = Vec::new();
-        File::open(input_path)?.read_to_end(&mut yuv_data)?;
+        File::open(&input_path)?.read_to_end(&mut yuv_data)?;
 
         let frame_size = match format {
             PixelFormat::Yuv420 => (WIDTH * HEIGHT * 3 / 2) as usize,
@@ -187,8 +190,8 @@ fn run_test(
 
     // Let's decode to the input format (8-bit).
     let (input_pix_fmt, input_path) = match format {
-        PixelFormat::Yuv420 => ("yuv420p", "testdata/test_frames_yuv420p.yuv"),
-        PixelFormat::Yuv444 => ("yuv444p", "testdata/test_frames_yuv444p.yuv"),
+        PixelFormat::Yuv420 => ("yuv420p", format!("testdata/test_frames_{}x{}_yuv420p.yuv", WIDTH, HEIGHT)),
+        PixelFormat::Yuv444 => ("yuv444p", format!("testdata/test_frames_{}x{}_yuv444p.yuv", WIDTH, HEIGHT)),
         _ => return Err("Unsupported format".into()),
     };
 
@@ -229,7 +232,7 @@ fn run_test(
             "-f",
             "rawvideo",
             "-i",
-            input_path,
+            &input_path,
             "-s",
             &format!("{}x{}", WIDTH, HEIGHT),
             "-pix_fmt",
