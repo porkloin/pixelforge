@@ -1,6 +1,7 @@
-use super::{H264Encoder, MIN_BITSTREAM_BUFFER_SIZE};
+use super::H264Encoder;
 
 use crate::encoder::gop::{GopFrameType, GopPosition};
+use crate::encoder::resources::{record_dpb_barriers, MIN_BITSTREAM_BUFFER_SIZE};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use tracing::debug;
@@ -28,9 +29,9 @@ impl H264Encoder {
         // Rate control setup.
         let (rc_mode, average_bitrate, max_bitrate, qp) = match self.config.rate_control_mode {
             crate::encoder::RateControlMode::Cqp | crate::encoder::RateControlMode::Disabled => (
-                vk::VideoEncodeRateControlModeFlagsKHR::VBR,
-                100_000_000, // 100 Mbps
-                100_000_000,
+                vk::VideoEncodeRateControlModeFlagsKHR::DISABLED,
+                0,
+                0,
                 self.config.quality_level as i32,
             ),
             crate::encoder::RateControlMode::Cbr => (
@@ -77,32 +78,16 @@ impl H264Encoder {
             );
         }
 
-        // Transition DPB image to video encode DPB layout if needed.
-        let dpb_barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(self.dpb_images[self.current_dpb_slot as usize])
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::empty());
-
+        // Transition DPB images for encode.
+        let ref_dpb_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
         unsafe {
-            self.context.device().cmd_pipeline_barrier(
+            record_dpb_barriers(
+                self.context.device(),
                 self.encode_command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE, // Use BOTTOM_OF_PIPE as VIDEO_ENCODE requires sync2
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[dpb_barrier],
+                &self.dpb_images,
+                self.use_layered_dpb,
+                self.current_dpb_slot,
+                &ref_dpb_slots,
             );
         }
 
@@ -135,7 +120,7 @@ impl H264Encoder {
 
         let slice_qp_delta = match self.config.rate_control_mode {
             crate::encoder::RateControlMode::Cqp | crate::encoder::RateControlMode::Disabled => {
-                ((self.config.quality_level as i32) - 26) as i8
+                (self.config.quality_level as i32 - 26) as i8
             }
             _ => 0,
         };
@@ -150,7 +135,7 @@ impl H264Encoder {
             reserved1: 0,
             cabac_init_idc:
                 ash::vk::native::StdVideoH264CabacInitIdc_STD_VIDEO_H264_CABAC_INIT_IDC_0,
-            disable_deblocking_filter_idc: ash::vk::native::StdVideoH264DisableDeblockingFilterIdc_STD_VIDEO_H264_DISABLE_DEBLOCKING_FILTER_IDC_DISABLED,
+            disable_deblocking_filter_idc: ash::vk::native::StdVideoH264DisableDeblockingFilterIdc_STD_VIDEO_H264_DISABLE_DEBLOCKING_FILTER_IDC_ENABLED,
             pWeightTable: std::ptr::null(),
         };
 
@@ -278,9 +263,9 @@ impl H264Encoder {
         };
 
         // Create slice NAL unit entry.
-        // constant_qp should only be set when rate control is DISABLED
+        // constant_qp should only be set when rate control is DISABLED.
         let constant_qp = if rc_mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
-            self.config.quality_level as i32
+            qp
         } else {
             0
         };
@@ -297,8 +282,8 @@ impl H264Encoder {
         let src_picture_resource = vk::VideoPictureResourceInfoKHR::default()
             .coded_offset(vk::Offset2D { x: 0, y: 0 })
             .coded_extent(vk::Extent2D {
-                width: self.config.dimensions.width,
-                height: self.config.dimensions.height,
+                width: self.aligned_width,
+                height: self.aligned_height,
             })
             .base_array_layer(0)
             .image_view_binding(self.input_image_view);
@@ -307,8 +292,8 @@ impl H264Encoder {
         let setup_picture_resource = vk::VideoPictureResourceInfoKHR::default()
             .coded_offset(vk::Offset2D { x: 0, y: 0 })
             .coded_extent(vk::Extent2D {
-                width: self.config.dimensions.width,
-                height: self.config.dimensions.height,
+                width: self.aligned_width,
+                height: self.aligned_height,
             })
             .base_array_layer(0)
             .image_view_binding(self.dpb_image_views[self.current_dpb_slot as usize]);
@@ -333,8 +318,8 @@ impl H264Encoder {
                 vk::VideoPictureResourceInfoKHR::default()
                     .coded_offset(vk::Offset2D { x: 0, y: 0 })
                     .coded_extent(vk::Extent2D {
-                        width: self.config.dimensions.width,
-                        height: self.config.dimensions.height,
+                        width: self.aligned_width,
+                        height: self.aligned_height,
                     })
                     .base_array_layer(0)
                     .image_view_binding(self.dpb_image_views[ref_info.dpb_slot as usize]),
@@ -381,8 +366,8 @@ impl H264Encoder {
             let resource = vk::VideoPictureResourceInfoKHR::default()
                 .coded_offset(vk::Offset2D { x: 0, y: 0 })
                 .coded_extent(vk::Extent2D {
-                    width: self.config.dimensions.width,
-                    height: self.config.dimensions.height,
+                    width: self.aligned_width,
+                    height: self.aligned_height,
                 })
                 .base_array_layer(0)
                 .image_view_binding(image_view);
@@ -580,25 +565,27 @@ impl H264Encoder {
             );
         }
 
-        // Reset video coding state for the first frame, then set rate control.
+        // Reset video coding state for the first frame.
+        // Combine RESET + RATE_CONTROL + QUALITY_LEVEL into a single control command.
+        // This matches FFmpeg's approach and is required for AMD RADV.
         if is_first_frame {
-            let reset_control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::RESET);
-            unsafe {
-                (self.video_queue_fn.fp().cmd_control_video_coding_khr)(
-                    self.encode_command_buffer,
-                    &reset_control_info,
-                );
-            }
+            let mut quality_level_info =
+                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+            quality_level_info.p_next =
+                (&mut rc_info as *mut vk::VideoEncodeRateControlInfoKHR).cast();
 
-            // After RESET, set the rate control mode.
-            let mut rate_control = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
-            rate_control.p_next = (&mut rc_info as *mut vk::VideoEncodeRateControlInfoKHR).cast();
+            let mut control_info = vk::VideoCodingControlInfoKHR::default().flags(
+                vk::VideoCodingControlFlagsKHR::RESET
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+            );
+            control_info.p_next =
+                (&mut quality_level_info as *mut vk::VideoEncodeQualityLevelInfoKHR).cast();
+
             unsafe {
                 (self.video_queue_fn.fp().cmd_control_video_coding_khr)(
                     self.encode_command_buffer,
-                    &rate_control,
+                    &control_info,
                 );
             }
         }

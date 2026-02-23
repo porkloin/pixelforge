@@ -1,11 +1,11 @@
-use super::{H264Encoder, MB_SIZE, MIN_BITSTREAM_BUFFER_SIZE};
+use super::{H264Encoder, MB_SIZE};
 
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::gop::GopStructure;
 use crate::encoder::resources::{
-    allocate_session_memory, create_bitstream_buffer, create_command_resources, create_dpb_images,
-    create_image, get_video_format, make_codec_name, map_bitstream_buffer,
-    query_supported_video_formats,
+    align_up, allocate_session_memory, create_bitstream_buffer, create_command_resources,
+    create_dpb_images, create_image, get_video_format, lcm, make_codec_name, map_bitstream_buffer,
+    query_supported_video_formats, MIN_BITSTREAM_BUFFER_SIZE,
 };
 use crate::encoder::PixelFormat;
 use crate::error::{PixelForgeError, Result};
@@ -103,28 +103,39 @@ impl H264Encoder {
             )));
         }
 
-        let gcd = |mut a: u32, mut b: u32| {
-            while b != 0 {
-                let tmp = a % b;
-                a = b;
-                b = tmp;
-            }
-            a
-        };
-        let lcm = |a: u32, b: u32| {
-            if a == 0 || b == 0 {
-                0
-            } else {
-                a / gcd(a, b) * b
-            }
-        };
-        let align_up = |value: u32, alignment: u32| {
-            if alignment <= 1 {
-                value
-            } else {
-                value.div_ceil(alignment) * alignment
-            }
-        };
+        debug!(
+            "H.264 capabilities: maxLevelIdc={}, maxSliceCount={}, maxPPictureL0ReferenceCount={}, maxBPictureL0ReferenceCount={}, maxL1ReferenceCount={}, maxTemporalLayerCount={}, prefersGopRemainingFrames={}, requiresGopRemainingFrames={}, stdSyntaxFlags={:#010x}",
+            h264_capabilities.max_level_idc,
+            h264_capabilities.max_slice_count,
+            h264_capabilities.max_p_picture_l0_reference_count,
+            h264_capabilities.max_b_picture_l0_reference_count,
+            h264_capabilities.max_l1_reference_count,
+            h264_capabilities.max_temporal_layer_count,
+            h264_capabilities.prefers_gop_remaining_frames,
+            h264_capabilities.requires_gop_remaining_frames,
+            h264_capabilities.std_syntax_flags.as_raw(),
+        );
+        debug!(
+            "Encode capabilities: encodeInputPictureGranularity={}x{}, supportedEncodeFeedbackFlags={:#010x}, maxQualityLevels={}",
+            encode_capabilities.encode_input_picture_granularity.width,
+            encode_capabilities.encode_input_picture_granularity.height,
+            encode_capabilities.supported_encode_feedback_flags.as_raw(),
+            encode_capabilities.max_quality_levels,
+        );
+        debug!(
+            "Video capabilities: flags={:#010x}, minBitstreamBufferOffsetAlignment={}, minBitstreamBufferSizeAlignment={}, minCodedExtent={}x{}, maxCodedExtent={}x{}, maxDpbSlots={}, maxActiveReferencePictures={}, pictureAccessGranularity={}x{}",
+            capabilities.flags.as_raw(),
+            capabilities.min_bitstream_buffer_offset_alignment,
+            capabilities.min_bitstream_buffer_size_alignment,
+            capabilities.min_coded_extent.width,
+            capabilities.min_coded_extent.height,
+            capabilities.max_coded_extent.width,
+            capabilities.max_coded_extent.height,
+            capabilities.max_dpb_slots,
+            capabilities.max_active_reference_pictures,
+            capabilities.picture_access_granularity.width,
+            capabilities.picture_access_granularity.height,
+        );
 
         let gran_w = capabilities.picture_access_granularity.width.max(1);
         let gran_h = capabilities.picture_access_granularity.height.max(1);
@@ -354,7 +365,7 @@ impl H264Encoder {
 
         let mut sps_flags: ash::vk::native::StdVideoH264SpsFlags = unsafe { std::mem::zeroed() };
         sps_flags.set_constraint_set3_flag(constraint_set3_flag);
-        sps_flags.set_direct_8x8_inference_flag(0);
+        sps_flags.set_direct_8x8_inference_flag(1);
         sps_flags.set_frame_mbs_only_flag(1);
         if frame_crop_right > 0 || frame_crop_bottom > 0 {
             sps_flags.set_frame_cropping_flag(1);
@@ -396,7 +407,10 @@ impl H264Encoder {
         vui_flags.set_video_signal_type_present_flag(1);
         vui_flags.set_video_full_range_flag(1);
         vui_flags.set_color_description_present_flag(1);
-        vui_flags.set_nal_hrd_parameters_present_flag(1);
+        // Do not set HRD parameters when rate control is disabled/CQP.
+        // HRD with zeroed bitrate values causes device loss on some drivers (AMD).
+        vui_flags.set_nal_hrd_parameters_present_flag(0);
+        vui_flags.set_bitstream_restriction_flag(1);
 
         let vui = ash::vk::native::StdVideoH264SequenceParameterSetVui {
             flags: vui_flags,
@@ -410,8 +424,8 @@ impl H264Encoder {
             matrix_coefficients: 1,
             num_units_in_tick: 0,
             time_scale: 0,
-            max_num_reorder_frames: 0,
-            max_dec_frame_buffering: 0,
+            max_num_reorder_frames: if config.b_frame_count > 0 { 1 } else { 0 },
+            max_dec_frame_buffering: (max_active_reference_pictures + 1) as u8,
             chroma_sample_loc_type_top_field: 0,
             chroma_sample_loc_type_bottom_field: 0,
             reserved1: 0,
@@ -427,12 +441,12 @@ impl H264Encoder {
             bit_depth_luma_minus8,
             bit_depth_chroma_minus8,
             log2_max_frame_num_minus4: 4,
-            pic_order_cnt_type: ash::vk::native::StdVideoH264PocType_STD_VIDEO_H264_POC_TYPE_2,
+            pic_order_cnt_type: ash::vk::native::StdVideoH264PocType_STD_VIDEO_H264_POC_TYPE_0,
             offset_for_non_ref_pic: 0,
             offset_for_top_to_bottom_field: 0,
             log2_max_pic_order_cnt_lsb_minus4: 4,
             num_ref_frames_in_pic_order_cnt_cycle: 0,
-            max_num_ref_frames: 3,
+            max_num_ref_frames: max_active_reference_pictures as u8,
             reserved1: 0,
             pic_width_in_mbs_minus1: pic_width_in_mbs - 1,
             pic_height_in_map_units_minus1: pic_height_in_map_units - 1,
@@ -448,7 +462,7 @@ impl H264Encoder {
 
         let mut pps_flags: ash::vk::native::StdVideoH264PpsFlags = unsafe { std::mem::zeroed() };
         pps_flags.set_transform_8x8_mode_flag(0);
-        pps_flags.set_entropy_coding_mode_flag(0);
+        pps_flags.set_entropy_coding_mode_flag(1);
         pps_flags.set_deblocking_filter_control_present_flag(1);
 
         // vk_video_samples sets chroma QP offsets to 6 for 4:4:4 unless lossless.
@@ -465,7 +479,7 @@ impl H264Encoder {
             num_ref_idx_l0_default_active_minus1: (max_active_reference_pictures as i8 - 1).max(0) as u8,
             num_ref_idx_l1_default_active_minus1: 0,
             weighted_bipred_idc: ash::vk::native::StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_DEFAULT,
-            pic_init_qp_minus26: -8,
+            pic_init_qp_minus26: 0,
             pic_init_qs_minus26: 0,
             chroma_qp_index_offset,
             second_chroma_qp_index_offset,
@@ -485,11 +499,17 @@ impl H264Encoder {
                 .max_std_pps_count(1)
                 .parameters_add_info(&h264_add_info);
 
-        let mut params_create_info =
-            vk::VideoSessionParametersCreateInfoKHR::default().video_session(session);
-        params_create_info.p_next = (&mut h264_params_create_info
+        // Chain quality level info into session parameters creation.
+        // This is required by AMD RADV and matches FFmpeg's approach.
+        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0); // Use quality level 0 (best quality).
+        quality_level_info.p_next = (&mut h264_params_create_info
             as *mut vk::VideoEncodeH264SessionParametersCreateInfoKHR)
             .cast();
+
+        let mut params_create_info =
+            vk::VideoSessionParametersCreateInfoKHR::default().video_session(session);
+        params_create_info.p_next =
+            (&mut quality_level_info as *mut vk::VideoEncodeQualityLevelInfoKHR).cast();
 
         let mut session_params = vk::VideoSessionParametersKHR::null();
         let result = unsafe {
@@ -528,6 +548,16 @@ impl H264Encoder {
             &profile_for_resources,
         )?;
 
+        // Determine DPB mode: use layered DPB when the driver does not advertise
+        // support for separate reference images (required for AMD RADV).
+        let supports_separate_dpb = capabilities
+            .flags
+            .contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES);
+        let use_layered_dpb = !supports_separate_dpb;
+        if use_layered_dpb {
+            info!("Using layered DPB (driver does not support separate reference images)");
+        }
+
         // Create DPB images.
         let (dpb_images, dpb_image_memories, dpb_image_views) = create_dpb_images(
             &context,
@@ -536,6 +566,7 @@ impl H264Encoder {
             reference_picture_format,
             dpb_slot_count,
             &profile_for_resources,
+            use_layered_dpb,
         )?;
 
         // Create bitstream buffer.
@@ -547,8 +578,13 @@ impl H264Encoder {
             map_bitstream_buffer(&context, bitstream_buffer_memory, MIN_BITSTREAM_BUFFER_SIZE)?;
 
         // Create command pool, buffers, and fences.
-        let cmd_resources = create_command_resources(&context, encode_queue_family)?;
+        // Use the transfer queue family for upload commands when the encode queue
+        // doesn't support transfer operations (AMD RADV).
+        let upload_queue_family = context.transfer_queue_family();
+        let cmd_resources =
+            create_command_resources(&context, encode_queue_family, upload_queue_family)?;
         let command_pool = cmd_resources.command_pool;
+        let upload_command_pool = cmd_resources.upload_command_pool;
         let upload_command_buffer = cmd_resources.upload_command_buffer;
         let encode_command_buffer = cmd_resources.encode_command_buffer;
         let upload_fence = cmd_resources.upload_fence;
@@ -622,6 +658,8 @@ impl H264Encoder {
             config: config.clone(),
             dpb,
             gop,
+            aligned_width,
+            aligned_height,
             video_queue_fn,
             video_encode_fn,
             session,
@@ -639,6 +677,7 @@ impl H264Encoder {
             dpb_image_memories,
             dpb_image_views,
             dpb_slot_count,
+            use_layered_dpb,
             current_dpb_slot: 0,
             l0_references: Vec::new(),
             active_reference_count: max_active_reference_pictures as u32,
@@ -646,6 +685,7 @@ impl H264Encoder {
             bitstream_buffer_memory,
             bitstream_buffer_ptr,
             command_pool,
+            upload_command_pool,
             upload_command_buffer,
             upload_fence,
             encode_command_buffer,

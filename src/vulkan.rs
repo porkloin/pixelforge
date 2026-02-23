@@ -182,21 +182,46 @@ impl VideoContext {
             .engine_version(vk::make_api_version(0, 1, 0, 0))
             .api_version(vk::API_VERSION_1_3);
 
+        let mut enable_validation = builder.enable_validation;
+        if enable_validation {
+            let available_layers = unsafe { entry.enumerate_instance_layer_properties() }
+                .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+            let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
+            let has_validation_layer = available_layers.iter().any(|layer| {
+                let name = unsafe { CStr::from_ptr(layer.layer_name.as_ptr()) };
+                name == validation_layer_name
+            });
+            if !has_validation_layer {
+                warn!("Validation layer requested but not available");
+                enable_validation = false;
+            }
+        }
+
         let mut layer_names: Vec<*const c_char> = Vec::new();
-        let validation_layer =
-            CString::new("VK_LAYER_KHRONOS_validation").expect("Invalid layer name");
-        if builder.enable_validation {
+        let validation_layer = c"VK_LAYER_KHRONOS_validation";
+        if enable_validation {
             layer_names.push(validation_layer.as_ptr());
         }
 
         // Enable VK_EXT_validation_features if validation is enabled to allow configuration.
-        let validation_features_ext =
-            CString::new("VK_EXT_validation_features").expect("Invalid extension name");
-        let instance_extensions: Vec<*const c_char> = if builder.enable_validation {
-            vec![validation_features_ext.as_ptr()]
-        } else {
-            vec![]
-        };
+        let mut instance_extensions: Vec<*const c_char> = Vec::new();
+        if enable_validation {
+            let validation_layer_name = c"VK_LAYER_KHRONOS_validation";
+            let available_exts = unsafe {
+                entry.enumerate_instance_extension_properties(Some(validation_layer_name))
+            }
+            .map_err(|e| PixelForgeError::InstanceCreation(e.to_string()))?;
+            let validation_features_name = c"VK_EXT_validation_features";
+            let has_validation_features = available_exts.iter().any(|ext| {
+                let name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
+                name == validation_features_name
+            });
+            if has_validation_features {
+                instance_extensions.push(validation_features_name.as_ptr());
+            } else {
+                warn!("VK_EXT_validation_features requested but not available");
+            }
+        }
 
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)

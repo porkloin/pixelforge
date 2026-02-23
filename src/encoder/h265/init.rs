@@ -1,10 +1,11 @@
-use super::{H265Encoder, CTB_SIZE, MIN_BITSTREAM_BUFFER_SIZE};
+use super::H265Encoder;
 
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::gop::GopStructure;
 use crate::encoder::resources::{
-    allocate_session_memory, create_bitstream_buffer, create_command_resources, create_dpb_images,
-    create_image, get_video_format, make_codec_name, map_bitstream_buffer,
+    align_up, allocate_session_memory, create_bitstream_buffer, create_command_resources,
+    create_dpb_images, create_image, get_video_format, lcm, make_codec_name, map_bitstream_buffer,
+    query_supported_video_formats, MIN_BITSTREAM_BUFFER_SIZE,
 };
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
@@ -28,14 +29,9 @@ impl H265Encoder {
         let width = config.dimensions.width;
         let height = config.dimensions.height;
 
-        // H.265 uses CTB (Coding Tree Block) sizes of 16, 32, or 64 pixels.
-        // We use 32 as the default CTB size.
-        let aligned_width = (width + CTB_SIZE - 1) & !(CTB_SIZE - 1);
-        let aligned_height = (height + CTB_SIZE - 1) & !(CTB_SIZE - 1);
-
         info!(
-            "Creating H.265 encoder: {}x{} (aligned: {}x{}, CTB size: {}), pixel_format={:?}",
-            width, height, aligned_width, aligned_height, CTB_SIZE, config.pixel_format
+            "Creating H.265 encoder: {}x{}, pixel_format={:?}",
+            width, height, config.pixel_format
         );
 
         // Load video queue extension functions.
@@ -118,6 +114,94 @@ impl H265Encoder {
             )));
         }
 
+        // Compute aligned coded extent using capabilities (picture_access_granularity,
+        // min/max_coded_extent) - required for AMD which reports granularity 64x16 and
+        // min_coded_extent 130x128.
+        let ctb_size = super::CTB_SIZE;
+        let gran_w = capabilities.picture_access_granularity.width.max(1);
+        let gran_h = capabilities.picture_access_granularity.height.max(1);
+        let align_w = lcm(ctb_size, gran_w);
+        let align_h = lcm(ctb_size, gran_h);
+
+        let mut aligned_width = align_up(width, align_w);
+        let mut aligned_height = align_up(height, align_h);
+
+        aligned_width = aligned_width.max(capabilities.min_coded_extent.width);
+        aligned_height = aligned_height.max(capabilities.min_coded_extent.height);
+
+        if aligned_width > capabilities.max_coded_extent.width
+            || aligned_height > capabilities.max_coded_extent.height
+        {
+            return Err(PixelForgeError::InvalidInput(format!(
+                "Requested coded extent {}x{} (aligned to {}x{} with granularity {}x{}) exceeds device max {}x{} for this profile",
+                width,
+                height,
+                aligned_width,
+                aligned_height,
+                gran_w,
+                gran_h,
+                capabilities.max_coded_extent.width,
+                capabilities.max_coded_extent.height
+            )));
+        }
+
+        info!(
+            "Using coded extent {}x{} (granularity {}x{}, min {}x{}, max {}x{})",
+            aligned_width,
+            aligned_height,
+            gran_w,
+            gran_h,
+            capabilities.min_coded_extent.width,
+            capabilities.min_coded_extent.height,
+            capabilities.max_coded_extent.width,
+            capabilities.max_coded_extent.height
+        );
+
+        // Query supported formats for SRC and DPB usage.
+        let supported_src_formats = query_supported_video_formats(
+            &context,
+            &profile_info,
+            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
+        )?;
+        let supported_dpb_formats = query_supported_video_formats(
+            &context,
+            &profile_info,
+            vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR,
+        )?;
+
+        if supported_src_formats.is_empty() {
+            return Err(PixelForgeError::NoSuitableDevice(
+                "No supported Vulkan Video SRC formats returned for this H.265 profile".to_string(),
+            ));
+        }
+        info!("Supported SRC formats: {:?}", supported_src_formats);
+        if supported_dpb_formats.is_empty() {
+            return Err(PixelForgeError::NoSuitableDevice(
+                "No supported Vulkan Video DPB formats returned for this H.265 profile".to_string(),
+            ));
+        }
+        info!("Supported DPB formats: {:?}", supported_dpb_formats);
+
+        let picture_format = if supported_src_formats.contains(&video_format) {
+            video_format
+        } else {
+            return Err(PixelForgeError::NoSuitableDevice(format!(
+                "Preferred input format {:?} is not supported for VIDEO_ENCODE_SRC_KHR. Supported: {:?}",
+                video_format, supported_src_formats
+            )));
+        };
+
+        let reference_picture_format = supported_dpb_formats
+            .iter()
+            .copied()
+            .find(|f| *f == picture_format)
+            .unwrap_or(supported_dpb_formats[0]);
+
+        debug!(
+            "Selected Vulkan Video formats: picture_format={:?}, reference_picture_format={:?}",
+            picture_format, reference_picture_format
+        );
+
         let max_dpb_slots_supported = capabilities.max_dpb_slots as usize;
         let max_active_reference_pictures_supported =
             capabilities.max_active_reference_pictures as usize;
@@ -177,12 +261,12 @@ impl H265Encoder {
             .queue_family_index(encode_queue_family)
             .flags(vk::VideoSessionCreateFlagsKHR::empty())
             .video_profile(&profile_info)
-            .picture_format(video_format)
+            .picture_format(picture_format)
             .max_coded_extent(vk::Extent2D {
                 width: aligned_width,
                 height: aligned_height,
             })
-            .reference_picture_format(video_format)
+            .reference_picture_format(reference_picture_format)
             .max_dpb_slots(dpb_slot_count as u32)
             .max_active_reference_pictures(max_active_reference_pictures as u32)
             .std_header_version(&std_header_version);
@@ -527,11 +611,17 @@ impl H265Encoder {
                 .max_std_pps_count(1)
                 .parameters_add_info(&h265_add_info);
 
-        let mut params_create_info =
-            vk::VideoSessionParametersCreateInfoKHR::default().video_session(session);
-        params_create_info.p_next = (&mut h265_params_create_info
+        // Chain quality level info into session parameters creation.
+        // This is required by AMD RADV and matches FFmpeg's approach.
+        let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0); // Use quality level 0 (best quality).
+        quality_level_info.p_next = (&mut h265_params_create_info
             as *mut vk::VideoEncodeH265SessionParametersCreateInfoKHR)
             .cast();
+
+        let mut params_create_info =
+            vk::VideoSessionParametersCreateInfoKHR::default().video_session(session);
+        params_create_info.p_next =
+            (&mut quality_level_info as *mut vk::VideoEncodeQualityLevelInfoKHR).cast();
 
         let mut session_params = vk::VideoSessionParametersKHR::null();
         let result = unsafe {
@@ -565,19 +655,30 @@ impl H265Encoder {
             &context,
             aligned_width,
             aligned_height,
-            video_format,
+            picture_format,
             false,
             &profile_for_resources,
         )?;
+
+        // Determine DPB mode: use layered DPB when the driver does not advertise
+        // support for separate reference images (required for AMD RADV).
+        let supports_separate_dpb = capabilities
+            .flags
+            .contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES);
+        let use_layered_dpb = !supports_separate_dpb;
+        if use_layered_dpb {
+            info!("Using layered DPB (driver does not support separate reference images)");
+        }
 
         // Create DPB images.
         let (dpb_images, dpb_image_memories, dpb_image_views) = create_dpb_images(
             &context,
             aligned_width,
             aligned_height,
-            video_format,
+            reference_picture_format,
             dpb_slot_count,
             &profile_for_resources,
+            use_layered_dpb,
         )?;
 
         // Create bitstream buffer.
@@ -589,8 +690,13 @@ impl H265Encoder {
             map_bitstream_buffer(&context, bitstream_buffer_memory, MIN_BITSTREAM_BUFFER_SIZE)?;
 
         // Create command pool, buffers, and fences.
-        let cmd_resources = create_command_resources(&context, encode_queue_family)?;
+        // Use the transfer queue family for upload commands when the encode queue
+        // doesn't support transfer operations (AMD RADV).
+        let upload_queue_family = context.transfer_queue_family();
+        let cmd_resources =
+            create_command_resources(&context, encode_queue_family, upload_queue_family)?;
         let command_pool = cmd_resources.command_pool;
+        let upload_command_pool = cmd_resources.upload_command_pool;
         let upload_command_buffer = cmd_resources.upload_command_buffer;
         let encode_command_buffer = cmd_resources.encode_command_buffer;
         let upload_fence = cmd_resources.upload_fence;
@@ -682,10 +788,12 @@ impl H265Encoder {
             dpb_image_memories,
             dpb_image_views,
             dpb_slot_count,
+            use_layered_dpb,
             bitstream_buffer,
             bitstream_buffer_memory,
             bitstream_buffer_ptr,
             command_pool,
+            upload_command_pool,
             upload_command_buffer,
             upload_fence,
             encode_command_buffer,
