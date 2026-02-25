@@ -497,8 +497,8 @@ impl H264Encoder {
         let mut pps_flags: ash::vk::native::StdVideoH264PpsFlags = unsafe { std::mem::zeroed() };
         // Enable 8x8 transform for High profile and above (required by some
         // drivers for High 4:4:4 Predictive SPS/PPS generation).
-        let transform_8x8 = profile_idc
-            >= ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH;
+        let transform_8x8 =
+            profile_idc >= ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH;
         pps_flags.set_transform_8x8_mode_flag(transform_8x8 as u32);
         // Use the driver's preferred entropy coding mode from quality level properties.
         // Some drivers (e.g., NVIDIA for H.264 High 4:4:4 Predictive) require CAVLC.

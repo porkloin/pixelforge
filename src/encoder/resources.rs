@@ -661,10 +661,7 @@ pub(crate) struct ClearImageParams {
 /// extent) contains defined values. Without this, the first frame's
 /// padding is undefined, which can cause encoding artifacts on strict
 /// drivers.
-pub(crate) fn clear_input_image(
-    context: &VideoContext,
-    params: &ClearImageParams,
-) -> Result<()> {
+pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParams) -> Result<()> {
     let device = context.device();
     let bytes_per_component: u32 = match params.bit_depth {
         BitDepth::Eight => 1,
