@@ -535,8 +535,8 @@ impl H264Encoder {
         if rc_mode != vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
             rc_info = rc_info
                 .layers(&rc_layers)
-                .virtual_buffer_size_in_ms(1000)
-                .initial_virtual_buffer_size_in_ms(1000);
+                .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
+                .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms);
             rc_info.p_next = &mut h264_rc_info as *mut _ as *mut std::ffi::c_void;
         }
 

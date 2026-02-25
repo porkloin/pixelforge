@@ -171,6 +171,17 @@ pub struct EncodeConfig {
     pub b_frame_count: u32,
     /// Maximum number of reference frames.
     pub max_reference_frames: u32,
+    /// VBV/HRD virtual buffer size in milliseconds.
+    /// Controls how much the encoder can deviate from the target bitrate
+    /// on a per-frame basis. Smaller values produce more uniform frame
+    /// sizes.
+    pub virtual_buffer_size_ms: u32,
+    /// Initial VBV buffer fullness in milliseconds.
+    /// Controls how much budget the encoder has for IDR/I-frames.
+    /// Setting this to 0 constrains IDR frames to the same budget as
+    /// P-frames. Setting it equal to `virtual_buffer_size_ms` gives
+    /// IDR frames maximum headroom.
+    pub initial_virtual_buffer_size_ms: u32,
 }
 
 impl EncodeConfig {
@@ -193,6 +204,8 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
+            virtual_buffer_size_ms: 1000,
+            initial_virtual_buffer_size_ms: 1000,
         }
     }
 
@@ -215,6 +228,8 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
+            virtual_buffer_size_ms: 1000,
+            initial_virtual_buffer_size_ms: 1000,
         }
     }
 
@@ -276,6 +291,21 @@ impl EncodeConfig {
     /// Set the maximum bitrate.
     pub fn with_max_bitrate(mut self, bitrate: u32) -> Self {
         self.max_bitrate = bitrate;
+        self
+    }
+
+    /// Set the VBV/HRD virtual buffer size in milliseconds.
+    /// Smaller values produce more uniform frame sizes at the cost of
+    /// quality variation during scene changes.
+    pub fn with_virtual_buffer_size_ms(mut self, ms: u32) -> Self {
+        self.virtual_buffer_size_ms = ms;
+        self
+    }
+
+    /// Set the initial VBV buffer fullness in milliseconds.
+    /// Use 0 to tightly constrain IDR/I-frame sizes.
+    pub fn with_initial_virtual_buffer_size_ms(mut self, ms: u32) -> Self {
+        self.initial_virtual_buffer_size_ms = ms;
         self
     }
 }
