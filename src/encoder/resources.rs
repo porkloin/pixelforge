@@ -671,10 +671,13 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
     // Calculate per-plane sizes.
     let plane0_size = params.width * params.height * bytes_per_component;
     let plane1_size = match params.pixel_format {
-        // NV12: UV plane is half width, half height, 2 components per pixel.
+        // YUV 4:2:0 (e.g., NV12): UV plane is half width, half height, 2 components per pixel.
         PixelFormat::Yuv420 => (params.width / 2) * (params.height / 2) * 2 * bytes_per_component,
-        // NV24: UV plane is full width, full height, 2 components per pixel.
+        // YUV 4:2:2: UV plane is half width, full height, 2 components per pixel.
+        PixelFormat::Yuv422 => (params.width / 2) * params.height * 2 * bytes_per_component,
+        // YUV 4:4:4 (e.g., NV24): UV plane is full width, full height, 2 components per pixel.
         PixelFormat::Yuv444 => params.width * params.height * 2 * bytes_per_component,
+        // Default to 4:2:0-style chroma for any other subsampled formats.
         _ => (params.width / 2) * (params.height / 2) * 2 * bytes_per_component,
     };
     let total_size = (plane0_size + plane1_size) as vk::DeviceSize;
