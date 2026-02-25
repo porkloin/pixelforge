@@ -2,9 +2,10 @@
 //!
 //! This module handles the actual frame encoding using Vulkan Video.
 
-use super::{H265Encoder, MIN_BITSTREAM_BUFFER_SIZE};
+use super::H265Encoder;
 
 use crate::encoder::gop::{GopFrameType, GopPosition};
+use crate::encoder::resources::{record_dpb_barriers, MIN_BITSTREAM_BUFFER_SIZE};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use tracing::debug;
@@ -53,33 +54,17 @@ impl H265Encoder {
             );
         }
 
-        // Transition DPB image to video encode DPB layout.
-        // Always transition from UNDEFINED for simplicity and consistency with H264 encoder.
-        let dpb_barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(self.dpb_images[self.current_dpb_slot as usize])
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::empty());
-
+        // Transition DPB images for encode.
+        let ref_dpb_slots: Vec<u8> = self.l0_references.iter().map(|r| r.dpb_slot).collect();
         unsafe {
-            self.context.device().cmd_pipeline_barrier(
+            record_dpb_barriers(
+                self.context.device(),
                 self.encode_command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[dpb_barrier],
+                &self.dpb_images,
+                self.use_layered_dpb,
+                self.current_dpb_slot,
+                &ref_dpb_slots,
+                self.dpb_slot_active[self.current_dpb_slot as usize],
             );
         }
 
@@ -578,8 +563,8 @@ impl H265Encoder {
         if rc_mode != vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
             rc_info = rc_info
                 .layers(&rc_layers)
-                .virtual_buffer_size_in_ms(1000)
-                .initial_virtual_buffer_size_in_ms(1000);
+                .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
+                .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms);
             rc_info.p_next =
                 (&mut h265_rc_info as *mut vk::VideoEncodeH265RateControlInfoKHR).cast();
         }
@@ -609,24 +594,26 @@ impl H265Encoder {
         }
 
         // Reset video coding state for the first frame.
+        // Combine RESET + RATE_CONTROL + QUALITY_LEVEL into a single control command.
+        // This matches FFmpeg's approach and is required for AMD RADV.
         if is_first_frame {
-            let reset_control_info = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::RESET);
-            unsafe {
-                (self.video_queue_fn.fp().cmd_control_video_coding_khr)(
-                    self.encode_command_buffer,
-                    &reset_control_info,
-                );
-            }
+            let mut quality_level_info =
+                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
+            quality_level_info.p_next =
+                (&mut rc_info as *mut vk::VideoEncodeRateControlInfoKHR).cast();
 
-            // Set rate control after reset.
-            let mut rate_control = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
-            rate_control.p_next = (&mut rc_info as *mut vk::VideoEncodeRateControlInfoKHR).cast();
+            let mut control_info = vk::VideoCodingControlInfoKHR::default().flags(
+                vk::VideoCodingControlFlagsKHR::RESET
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+            );
+            control_info.p_next =
+                (&mut quality_level_info as *mut vk::VideoEncodeQualityLevelInfoKHR).cast();
+
             unsafe {
                 (self.video_queue_fn.fp().cmd_control_video_coding_khr)(
                     self.encode_command_buffer,
-                    &rate_control,
+                    &control_info,
                 );
             }
         }
@@ -663,17 +650,28 @@ impl H265Encoder {
 
         // Add DPB synchronization barrier after encoding.
         {
+            let post_dpb_image = if self.use_layered_dpb {
+                self.dpb_images[0]
+            } else {
+                self.dpb_images[self.current_dpb_slot as usize]
+            };
+            let post_dpb_layer = if self.use_layered_dpb {
+                self.current_dpb_slot as u32
+            } else {
+                0
+            };
+
             let dpb_sync_barrier = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
                 .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.dpb_images[self.current_dpb_slot as usize])
+                .image(post_dpb_image)
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
                     level_count: 1,
-                    base_array_layer: 0,
+                    base_array_layer: post_dpb_layer,
                     layer_count: 1,
                 })
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)

@@ -9,16 +9,15 @@ mod init;
 use ash::vk;
 use tracing::debug;
 
-use crate::encoder::resources::{upload_image_to_input, UploadParams};
+use crate::encoder::resources::{
+    destroy_encoder_resources, upload_image_to_input, EncoderResources, UploadParams,
+};
 use crate::error::Result;
 
 use crate::encoder::dpb::DecodedPictureBuffer;
 use crate::encoder::gop::GopStructure;
 use crate::encoder::EncodeConfig;
 use crate::vulkan::VideoContext;
-
-/// Minimum bitstream buffer size.
-const MIN_BITSTREAM_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 /// H.264 macroblock size in pixels.
 pub const MB_SIZE: u32 = 16;
@@ -36,6 +35,11 @@ pub struct H264Encoder {
     config: EncodeConfig,
     dpb: DecodedPictureBuffer,
     gop: GopStructure,
+
+    /// Aligned width (macroblock + granularity aligned).
+    aligned_width: u32,
+    /// Aligned height (macroblock + granularity aligned).
+    aligned_height: u32,
 
     // Video session.
     video_queue_fn: ash::khr::video_queue::Device,
@@ -62,6 +66,10 @@ pub struct H264Encoder {
     dpb_image_views: Vec<vk::ImageView>,
     /// Number of DPB slots allocated.
     dpb_slot_count: usize,
+    /// Whether the DPB uses a single layered image (true) or separate images (false).
+    use_layered_dpb: bool,
+    /// Tracks which DPB slots have been activated (used at least once).
+    dpb_slot_active: Vec<bool>,
     bitstream_buffer: vk::Buffer,
     bitstream_buffer_memory: vk::DeviceMemory,
     /// Persistently mapped pointer to the bitstream buffer (avoids per-frame map/unmap).
@@ -69,6 +77,7 @@ pub struct H264Encoder {
 
     // Command resources.
     command_pool: vk::CommandPool,
+    upload_command_pool: vk::CommandPool,
     upload_command_buffer: vk::CommandBuffer,
     upload_fence: vk::Fence,
     encode_command_buffer: vk::CommandBuffer,
@@ -117,6 +126,7 @@ impl H264Encoder {
             height: self.config.dimensions.height,
             pixel_format: self.config.pixel_format,
             input_image_layout: self.input_image_layout,
+            upload_queue: self.context.transfer_queue(),
         };
 
         upload_image_to_input(&self.context, &params)?;
@@ -135,63 +145,37 @@ unsafe impl Send for H264Encoder {}
 impl Drop for H264Encoder {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.context.device().device_wait_idle();
-            self.context
+            // Wait on the queues used by the encoder rather than stalling
+            // the entire device.
+            let _ = self
+                .context
                 .device()
-                .destroy_query_pool(self.query_pool, None);
-            self.context.device().destroy_fence(self.upload_fence, None);
-            self.context.device().destroy_fence(self.encode_fence, None);
-            self.context
-                .device()
-                .destroy_command_pool(self.command_pool, None);
-            self.context
-                .device()
-                .destroy_buffer(self.bitstream_buffer, None);
-            // Unmap the persistently mapped bitstream buffer before freeing memory.
-            self.context
-                .device()
-                .unmap_memory(self.bitstream_buffer_memory);
-            self.context
-                .device()
-                .free_memory(self.bitstream_buffer_memory, None);
-
-            for i in 0..self.dpb_slot_count {
-                self.context
-                    .device()
-                    .destroy_image_view(self.dpb_image_views[i], None);
-                self.context
-                    .device()
-                    .destroy_image(self.dpb_images[i], None);
-                self.context
-                    .device()
-                    .free_memory(self.dpb_image_memories[i], None);
+                .queue_wait_idle(self.context.transfer_queue());
+            if let Some(q) = self.context.video_encode_queue() {
+                let _ = self.context.device().queue_wait_idle(q);
             }
-
-            self.context
-                .device()
-                .destroy_image_view(self.input_image_view, None);
-            self.context.device().destroy_image(self.input_image, None);
-            self.context
-                .device()
-                .free_memory(self.input_image_memory, None);
-
-            (self
-                .video_queue_fn
-                .fp()
-                .destroy_video_session_parameters_khr)(
-                self.context.device().handle(),
-                self.session_params,
-                std::ptr::null(),
+            destroy_encoder_resources(
+                self.context.device(),
+                &self.video_queue_fn,
+                &EncoderResources {
+                    query_pool: self.query_pool,
+                    upload_fence: self.upload_fence,
+                    encode_fence: self.encode_fence,
+                    command_pool: self.command_pool,
+                    upload_command_pool: self.upload_command_pool,
+                    bitstream_buffer: self.bitstream_buffer,
+                    bitstream_buffer_memory: self.bitstream_buffer_memory,
+                    input_image: self.input_image,
+                    input_image_memory: self.input_image_memory,
+                    input_image_view: self.input_image_view,
+                    dpb_images: &self.dpb_images,
+                    dpb_image_memories: &self.dpb_image_memories,
+                    dpb_image_views: &self.dpb_image_views,
+                    session: self.session,
+                    session_params: self.session_params,
+                    session_memory: &self.session_memory,
+                },
             );
-            (self.video_queue_fn.fp().destroy_video_session_khr)(
-                self.context.device().handle(),
-                self.session,
-                std::ptr::null(),
-            );
-
-            for memory in &self.session_memory {
-                self.context.device().free_memory(*memory, None);
-            }
         }
     }
 }
