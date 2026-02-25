@@ -677,8 +677,6 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
         PixelFormat::Yuv422 => (params.width / 2) * params.height * 2 * bytes_per_component,
         // YUV 4:4:4 (e.g., NV24): UV plane is full width, full height, 2 components per pixel.
         PixelFormat::Yuv444 => params.width * params.height * 2 * bytes_per_component,
-        // Default to 4:2:0-style chroma for any other subsampled formats.
-        _ => (params.width / 2) * (params.height / 2) * 2 * bytes_per_component,
     };
     let total_size = (plane0_size + plane1_size) as vk::DeviceSize;
 
