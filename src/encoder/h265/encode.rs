@@ -64,6 +64,7 @@ impl H265Encoder {
                 self.use_layered_dpb,
                 self.current_dpb_slot,
                 &ref_dpb_slots,
+                self.dpb_slot_active[self.current_dpb_slot as usize],
             );
         }
 

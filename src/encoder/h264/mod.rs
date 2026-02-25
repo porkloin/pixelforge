@@ -68,6 +68,8 @@ pub struct H264Encoder {
     dpb_slot_count: usize,
     /// Whether the DPB uses a single layered image (true) or separate images (false).
     use_layered_dpb: bool,
+    /// Tracks which DPB slots have been activated (used at least once).
+    dpb_slot_active: Vec<bool>,
     bitstream_buffer: vk::Buffer,
     bitstream_buffer_memory: vk::DeviceMemory,
     /// Persistently mapped pointer to the bitstream buffer (avoids per-frame map/unmap).

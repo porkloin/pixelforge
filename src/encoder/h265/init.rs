@@ -3,9 +3,10 @@ use super::H265Encoder;
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::gop::GopStructure;
 use crate::encoder::resources::{
-    align_up, allocate_session_memory, create_bitstream_buffer, create_command_resources,
-    create_dpb_images, create_image, get_video_format, lcm, make_codec_name, map_bitstream_buffer,
-    query_supported_video_formats, MIN_BITSTREAM_BUFFER_SIZE,
+    align_up, allocate_session_memory, clear_input_image, create_bitstream_buffer,
+    create_command_resources, create_dpb_images, create_image, get_video_format, lcm,
+    make_codec_name, map_bitstream_buffer, query_supported_video_formats, ClearImageParams,
+    MIN_BITSTREAM_BUFFER_SIZE,
 };
 use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
@@ -126,8 +127,14 @@ impl H265Encoder {
         let mut aligned_width = align_up(width, align_w);
         let mut aligned_height = align_up(height, align_h);
 
-        aligned_width = aligned_width.max(capabilities.min_coded_extent.width);
-        aligned_height = aligned_height.max(capabilities.min_coded_extent.height);
+        aligned_width = align_up(
+            aligned_width.max(capabilities.min_coded_extent.width),
+            align_w,
+        );
+        aligned_height = align_up(
+            aligned_height.max(capabilities.min_coded_extent.height),
+            align_h,
+        );
 
         if aligned_width > capabilities.max_coded_extent.width
             || aligned_height > capabilities.max_coded_extent.height
@@ -702,6 +709,22 @@ impl H265Encoder {
         let upload_fence = cmd_resources.upload_fence;
         let encode_fence = cmd_resources.encode_fence;
 
+        // Clear the input image so padding between user dimensions and the
+        // aligned coded extent is zero-initialized.
+        clear_input_image(
+            &context,
+            &ClearImageParams {
+                command_buffer: upload_command_buffer,
+                fence: upload_fence,
+                queue: context.transfer_queue(),
+                image: input_image,
+                width: aligned_width,
+                height: aligned_height,
+                pixel_format: config.pixel_format,
+                bit_depth: config.bit_depth,
+            },
+        )?;
+
         // Create query pool
         let mut h265_profile_info_query =
             vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
@@ -783,7 +806,7 @@ impl H265Encoder {
             input_image,
             input_image_memory,
             input_image_view,
-            input_image_layout: vk::ImageLayout::UNDEFINED,
+            input_image_layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
             dpb_images,
             dpb_image_memories,
             dpb_image_views,

@@ -88,6 +88,7 @@ impl H264Encoder {
                 self.use_layered_dpb,
                 self.current_dpb_slot,
                 &ref_dpb_slots,
+                self.dpb_slot_active[self.current_dpb_slot as usize],
             );
         }
 
@@ -686,6 +687,9 @@ impl H264Encoder {
             "Encode complete: offset={}, bytes_written={}",
             query_result.offset, query_result.bytes_written
         );
+
+        // Mark DPB slot as active.
+        self.dpb_slot_active[self.current_dpb_slot as usize] = true;
 
         // Read back the bitstream data using the persistently mapped buffer pointer.
         // This avoids per-frame map/unmap overhead (the buffer is mapped once at init)

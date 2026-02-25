@@ -642,6 +642,229 @@ pub(crate) fn map_bitstream_buffer(
     Ok(ptr)
 }
 
+/// Parameters for clearing the input image at initialization.
+pub(crate) struct ClearImageParams {
+    pub command_buffer: vk::CommandBuffer,
+    pub fence: vk::Fence,
+    pub queue: vk::Queue,
+    pub image: vk::Image,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: PixelFormat,
+    pub bit_depth: BitDepth,
+}
+
+/// Clear the input image by filling it with zeros via a staging buffer.
+///
+/// This must be called once after creating the input image to ensure
+/// the padding region (between the user dimensions and the aligned coded
+/// extent) contains defined values. Without this, the first frame's
+/// padding is undefined, which can cause encoding artifacts on strict
+/// drivers.
+pub(crate) fn clear_input_image(
+    context: &VideoContext,
+    params: &ClearImageParams,
+) -> Result<()> {
+    let device = context.device();
+    let bytes_per_component: u32 = match params.bit_depth {
+        BitDepth::Eight => 1,
+        BitDepth::Ten => 2,
+    };
+
+    // Calculate per-plane sizes.
+    let plane0_size = params.width * params.height * bytes_per_component;
+    let plane1_size = match params.pixel_format {
+        // NV12: UV plane is half width, half height, 2 components per pixel.
+        PixelFormat::Yuv420 => (params.width / 2) * (params.height / 2) * 2 * bytes_per_component,
+        // NV24: UV plane is full width, full height, 2 components per pixel.
+        PixelFormat::Yuv444 => params.width * params.height * 2 * bytes_per_component,
+        _ => (params.width / 2) * (params.height / 2) * 2 * bytes_per_component,
+    };
+    let total_size = (plane0_size + plane1_size) as vk::DeviceSize;
+
+    // Create a staging buffer filled with zeros.
+    let buffer_create_info = vk::BufferCreateInfo::default()
+        .size(total_size)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let staging_buffer = unsafe { device.create_buffer(&buffer_create_info, None) }
+        .map_err(|e| PixelForgeError::ResourceCreation(format!("staging buffer: {}", e)))?;
+
+    let mem_requirements = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
+    let memory_type_index = find_memory_type(
+        context.memory_properties(),
+        mem_requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )
+    .ok_or_else(|| {
+        PixelForgeError::MemoryAllocation("No suitable memory type for staging buffer".to_string())
+    })?;
+
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(mem_requirements.size)
+        .memory_type_index(memory_type_index);
+
+    let staging_memory = unsafe { device.allocate_memory(&alloc_info, None) }
+        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+
+    unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0) }
+        .map_err(|e| PixelForgeError::MemoryAllocation(e.to_string()))?;
+
+    // Map and zero-fill.
+    let data_ptr =
+        unsafe { device.map_memory(staging_memory, 0, total_size, vk::MemoryMapFlags::empty()) }
+            .map_err(|e| PixelForgeError::MemoryAllocation(format!("map staging buffer: {}", e)))?;
+    unsafe { ptr::write_bytes(data_ptr as *mut u8, 0, total_size as usize) };
+    unsafe { device.unmap_memory(staging_memory) };
+
+    // Record commands.
+    unsafe {
+        device.reset_command_buffer(params.command_buffer, vk::CommandBufferResetFlags::empty())
+    }
+    .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    let begin_info =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    unsafe { device.begin_command_buffer(params.command_buffer, &begin_info) }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    // Transition image from UNDEFINED to TRANSFER_DST.
+    let barrier = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(params.image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            params.command_buffer,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
+    }
+
+    // Copy from staging buffer to image planes.
+    let (uv_width, uv_height) = match params.pixel_format {
+        PixelFormat::Yuv420 => (params.width / 2, params.height / 2),
+        PixelFormat::Yuv444 => (params.width, params.height),
+        _ => (params.width / 2, params.height / 2),
+    };
+
+    let copy_regions = [
+        vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::PLANE_0,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width: params.width,
+                height: params.height,
+                depth: 1,
+            },
+        },
+        vk::BufferImageCopy {
+            buffer_offset: plane0_size as vk::DeviceSize,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::PLANE_1,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width: uv_width,
+                height: uv_height,
+                depth: 1,
+            },
+        },
+    ];
+
+    unsafe {
+        device.cmd_copy_buffer_to_image(
+            params.command_buffer,
+            staging_buffer,
+            params.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &copy_regions,
+        );
+    }
+
+    // Transition image to VIDEO_ENCODE_SRC.
+    let barrier = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(params.image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::empty());
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            params.command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
+    }
+
+    unsafe { device.end_command_buffer(params.command_buffer) }
+        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+
+    // Submit and wait.
+    let submit_info =
+        vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&params.command_buffer));
+    unsafe { device.reset_fences(&[params.fence]) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence: {}", e)))?;
+    unsafe { device.queue_submit(params.queue, &[submit_info], params.fence) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("submit clear: {}", e)))?;
+    unsafe { device.wait_for_fences(&[params.fence], true, u64::MAX) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("wait clear: {}", e)))?;
+    unsafe { device.reset_fences(&[params.fence]) }
+        .map_err(|e| PixelForgeError::CommandBuffer(format!("reset fence after clear: {}", e)))?;
+
+    // Clean up staging buffer.
+    unsafe {
+        device.destroy_buffer(staging_buffer, None);
+        device.free_memory(staging_memory, None);
+    }
+
+    Ok(())
+}
+
 /// Parameters for uploading an image to the encoder's input image.
 pub(crate) struct UploadParams {
     /// The command buffer to use for the upload.
@@ -893,7 +1116,8 @@ pub(crate) struct EncoderResources<'a> {
 ///
 /// # Safety
 ///
-/// The device must be idle before calling this function.
+/// All queues that may reference these resources (transfer and video encode)
+/// must be idle before calling this function.
 pub(crate) unsafe fn destroy_encoder_resources(
     device: &ash::Device,
     video_queue_fn: &ash::khr::video_queue::Device,
@@ -952,6 +1176,7 @@ pub(crate) unsafe fn record_dpb_barriers(
     use_layered_dpb: bool,
     current_dpb_slot: u8,
     reference_dpb_slots: &[u8],
+    setup_slot_active: bool,
 ) {
     let dpb_image = if use_layered_dpb {
         dpb_images[0]
@@ -964,8 +1189,17 @@ pub(crate) unsafe fn record_dpb_barriers(
         0
     };
 
+    // Use UNDEFINED only on first use of a DPB slot; after that it is already
+    // in VIDEO_ENCODE_DPB_KHR and transitioning from UNDEFINED would discard
+    // the contents, which is invalid/UB.
+    let setup_old_layout = if setup_slot_active {
+        vk::ImageLayout::VIDEO_ENCODE_DPB_KHR
+    } else {
+        vk::ImageLayout::UNDEFINED
+    };
+
     let dpb_barrier = vk::ImageMemoryBarrier::default()
-        .old_layout(vk::ImageLayout::UNDEFINED)
+        .old_layout(setup_old_layout)
         .new_layout(vk::ImageLayout::VIDEO_ENCODE_DPB_KHR)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
