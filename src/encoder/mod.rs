@@ -213,13 +213,21 @@ pub struct EncodeConfig {
     /// VBV/HRD virtual buffer size in milliseconds.
     /// Controls how much the encoder can deviate from the target bitrate
     /// on a per-frame basis. Smaller values produce more uniform frame
-    /// sizes.
+    /// sizes (good for low-latency streaming where I-frame bitrate spikes
+    /// cause network jitter); larger values let the encoder amortize
+    /// complex scenes over multiple frames at the cost of frame-size
+    /// variance.
+    ///
+    /// Default of 33 ms (~2 frame intervals at 60 Hz) follows AMF/NVENC
+    /// "ultra-low-latency" presets used by game-streaming hosts. For VOD
+    /// or transcoding bump to 1000 ms+.
     pub virtual_buffer_size_ms: u32,
     /// Initial VBV buffer fullness in milliseconds.
     /// Controls how much budget the encoder has for IDR/I-frames.
     /// Setting this to 0 constrains IDR frames to the same budget as
     /// P-frames. Setting it equal to `virtual_buffer_size_ms` gives
-    /// IDR frames maximum headroom.
+    /// IDR frames maximum headroom. Half-of-`virtual_buffer_size_ms` is
+    /// the documented sweet spot for low-latency streaming.
     pub initial_virtual_buffer_size_ms: u32,
     /// Color description for VUI signaling.
     /// Defaults to BT.709 (full-range) when `None`.
@@ -246,8 +254,8 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
-            virtual_buffer_size_ms: 1000,
-            initial_virtual_buffer_size_ms: 1000,
+            virtual_buffer_size_ms: 33,
+            initial_virtual_buffer_size_ms: 16,
             color_description: None,
         }
     }
@@ -271,8 +279,8 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
-            virtual_buffer_size_ms: 1000,
-            initial_virtual_buffer_size_ms: 1000,
+            virtual_buffer_size_ms: 33,
+            initial_virtual_buffer_size_ms: 16,
             color_description: None,
         }
     }
@@ -296,8 +304,8 @@ impl EncodeConfig {
             gop_size: DEFAULT_GOP_SIZE,
             b_frame_count: 0, // Start without B-frames for simplicity.
             max_reference_frames: DEFAULT_MAX_REFERENCE_FRAMES,
-            virtual_buffer_size_ms: 1000,
-            initial_virtual_buffer_size_ms: 1000,
+            virtual_buffer_size_ms: 33,
+            initial_virtual_buffer_size_ms: 16,
             color_description: None,
         }
     }
