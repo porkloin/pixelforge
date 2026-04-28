@@ -74,9 +74,21 @@ impl H265Encoder {
             }
         };
 
-        // Create H.265 encode profile
+        // Create H.265 encode profile.
+        //
+        // The pNext chain is: VideoProfileInfoKHR -> VideoEncodeH265ProfileInfoKHR
+        // -> VideoEncodeUsageInfoKHR. The usage info conveys "this is a real-time
+        // game stream" to the driver — implementations (most relevantly RADV's
+        // VCN driver) use it to pick lower-latency internal scheduling. Drivers
+        // that don't honor the hint ignore the chain harmlessly.
+        let mut usage_info = vk::VideoEncodeUsageInfoKHR::default()
+            .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
+            .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
+            .tuning_mode(vk::VideoEncodeTuningModeKHR::LOW_LATENCY);
+
         let mut h265_profile_info =
             vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
+        h265_profile_info.p_next = (&mut usage_info as *mut vk::VideoEncodeUsageInfoKHR).cast();
 
         let mut profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
@@ -302,9 +314,17 @@ impl H265Encoder {
             .color_description
             .unwrap_or(ColorDescription::bt709());
 
-        // Create profile info for images/buffers
+        // Create profile info for images/buffers. Profiles must match the one
+        // used at session creation, so the same VideoEncodeUsageInfoKHR chain
+        // gets attached here.
+        let mut usage_info_for_resources = vk::VideoEncodeUsageInfoKHR::default()
+            .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
+            .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
+            .tuning_mode(vk::VideoEncodeTuningModeKHR::LOW_LATENCY);
         let mut h265_profile_for_resources =
             vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
+        h265_profile_for_resources.p_next =
+            (&mut usage_info_for_resources as *mut vk::VideoEncodeUsageInfoKHR).cast();
         let mut profile_for_resources = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
             .chroma_subsampling(chroma_subsampling)
@@ -381,9 +401,15 @@ impl H265Encoder {
             },
         )?;
 
-        // Create query pool
+        // Create query pool — same profile chain as session/resources.
+        let mut usage_info_query = vk::VideoEncodeUsageInfoKHR::default()
+            .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
+            .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
+            .tuning_mode(vk::VideoEncodeTuningModeKHR::LOW_LATENCY);
         let mut h265_profile_info_query =
             vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
+        h265_profile_info_query.p_next =
+            (&mut usage_info_query as *mut vk::VideoEncodeUsageInfoKHR).cast();
 
         let mut profile_info_query = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)

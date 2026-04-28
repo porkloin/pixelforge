@@ -63,7 +63,19 @@ impl AV1Encoder {
         let preferred_src_format = get_video_format(config.pixel_format, config.bit_depth);
 
         // Create AV1 encode profile.
+        //
+        // The pNext chain is: VideoProfileInfoKHR -> VideoEncodeAV1ProfileInfoKHR
+        // -> VideoEncodeUsageInfoKHR. The usage info conveys "this is a real-time
+        // game stream" to the driver — implementations (most relevantly RADV's
+        // VCN driver) use it to pick lower-latency internal scheduling. Drivers
+        // that don't honor the hint ignore the chain harmlessly.
+        let mut usage_info = vk::VideoEncodeUsageInfoKHR::default()
+            .video_usage_hints(vk::VideoEncodeUsageFlagsKHR::STREAMING)
+            .video_content_hints(vk::VideoEncodeContentFlagsKHR::RENDERED)
+            .tuning_mode(vk::VideoEncodeTuningModeKHR::LOW_LATENCY);
+
         let mut av1_profile_info = vk::VideoEncodeAV1ProfileInfoKHR::default().std_profile(profile);
+        av1_profile_info.p_next = (&mut usage_info as *mut vk::VideoEncodeUsageInfoKHR).cast();
 
         let mut profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
