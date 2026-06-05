@@ -42,6 +42,7 @@ impl H264Encoder {
         );
 
         self.upload_from_image(src_image)?;
+
         self.encode_current_frame(&gop_position, display_order)?;
 
         self.current_slot = (self.current_slot + 1) % self.slots.len();

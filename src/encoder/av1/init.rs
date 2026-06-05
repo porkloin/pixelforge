@@ -3,8 +3,8 @@ use super::{AV1Encoder, MIN_BITSTREAM_BUFFER_SIZE, SUPERBLOCK_SIZE};
 use crate::encoder::gop::GopStructure;
 use crate::encoder::resources::{
     allocate_session_memory, clear_input_image, create_bitstream_buffer, create_command_resources,
-    create_dpb_images, create_image, get_video_format, make_codec_name, map_bitstream_buffer,
-    query_supported_video_formats, ClearImageParams,
+    create_dpb_images, create_image, create_timeline_semaphore, get_video_format, make_codec_name,
+    map_bitstream_buffer, query_supported_video_formats, ClearImageParams,
 };
 use crate::encoder::{ColorDescription, PixelFormat};
 use crate::error::{PixelForgeError, Result};
@@ -398,6 +398,7 @@ impl AV1Encoder {
 
         // Initialize GOP structure.
         let gop = GopStructure::new(config.gop_size, config.b_frame_count, config.gop_size);
+        let encode_timeline_semaphore = create_timeline_semaphore(&context)?;
 
         let mut encoder = Self {
             context,
@@ -414,6 +415,9 @@ impl AV1Encoder {
             order_hint: 0,
             slots,
             current_slot: 0,
+            encode_timeline_semaphore,
+            next_encode_timeline_value: 1,
+            last_encode_timeline_value: 0,
             dpb_images,
             dpb_image_memories,
             dpb_image_views,

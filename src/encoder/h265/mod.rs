@@ -110,6 +110,10 @@ pub struct H265Encoder {
     /// can keep two frames in flight at once.
     pub(crate) slots: Vec<EncodeSlot>,
     pub(crate) current_slot: usize,
+    /// Timeline semaphore used to serialize encode submissions that share DPB state.
+    encode_timeline_semaphore: vk::Semaphore,
+    next_encode_timeline_value: u64,
+    last_encode_timeline_value: u64,
 
     /// DPB images.
     dpb_images: Vec<vk::Image>,
@@ -217,6 +221,7 @@ impl Drop for H265Encoder {
                 device.destroy_image(slot.input_image, None);
                 device.free_memory(slot.input_image_memory, None);
             }
+            device.destroy_semaphore(self.encode_timeline_semaphore, None);
 
             // Shared resources.
             device.destroy_fence(self.upload_fence, None);

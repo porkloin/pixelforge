@@ -248,6 +248,19 @@ pub(crate) fn create_bitstream_buffer(
 
     Ok((buffer, memory))
 }
+
+pub(crate) fn create_timeline_semaphore(context: &VideoContext) -> Result<vk::Semaphore> {
+    let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+    let create_info = vk::SemaphoreCreateInfo {
+        p_next: (&mut type_info as *mut vk::SemaphoreTypeCreateInfo).cast(),
+        ..Default::default()
+    };
+
+    unsafe { context.device().create_semaphore(&create_info, None) }
+        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))
+}
 /// Create an image for video encoding (input or DPB).
 ///
 /// This creates a VkImage suitable for use with a video encoder.
@@ -1343,20 +1356,42 @@ pub(crate) unsafe fn submit_encode_only(
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     encode_queue: vk::Queue,
-    wait_semaphore: Option<vk::Semaphore>,
+    wait_timeline: Option<(vk::Semaphore, u64)>,
+    signal_timeline: Option<(vk::Semaphore, u64)>,
 ) -> Result<()> {
-    let wait_semaphores: Vec<vk::Semaphore>;
-    let wait_dst_stage_mask: Vec<vk::PipelineStageFlags>;
+    let mut wait_semaphores = Vec::new();
+    let mut wait_dst_stage_mask = Vec::new();
+    let mut signal_semaphores = Vec::new();
+    let mut wait_values = Vec::new();
+    let mut signal_values = Vec::new();
 
     let mut submit_info =
         vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
 
-    if let Some(sem) = wait_semaphore {
-        wait_semaphores = vec![sem];
-        wait_dst_stage_mask = vec![vk::PipelineStageFlags::ALL_COMMANDS];
+    if let Some((sem, value)) = wait_timeline {
+        wait_semaphores.push(sem);
+        wait_dst_stage_mask.push(vk::PipelineStageFlags::ALL_COMMANDS);
+        wait_values.push(value);
+    }
+    if let Some((sem, value)) = signal_timeline {
+        signal_semaphores.push(sem);
+        signal_values.push(value);
+    }
+
+    let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
+        .wait_semaphore_values(&wait_values)
+        .signal_semaphore_values(&signal_values);
+
+    if !wait_semaphores.is_empty() {
         submit_info = submit_info
             .wait_semaphores(&wait_semaphores)
             .wait_dst_stage_mask(&wait_dst_stage_mask);
+    }
+    if !signal_semaphores.is_empty() {
+        submit_info = submit_info.signal_semaphores(&signal_semaphores);
+    }
+    if !wait_values.is_empty() || !signal_values.is_empty() {
+        submit_info.p_next = (&mut timeline_info as *mut vk::TimelineSemaphoreSubmitInfo).cast();
     }
 
     device

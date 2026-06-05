@@ -4,8 +4,8 @@ use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbCo
 use crate::encoder::gop::GopStructure;
 use crate::encoder::resources::{
     align_up, allocate_session_memory, clear_input_image, create_bitstream_buffer,
-    create_command_resources, create_dpb_images, create_image, get_video_format, lcm,
-    map_bitstream_buffer, query_supported_video_formats, ClearImageParams,
+    create_command_resources, create_dpb_images, create_image, create_timeline_semaphore,
+    get_video_format, lcm, map_bitstream_buffer, query_supported_video_formats, ClearImageParams,
     MIN_BITSTREAM_BUFFER_SIZE,
 };
 use crate::encoder::ColorDescription;
@@ -584,6 +584,8 @@ impl H264Encoder {
 
         info!("H.264 encoder created successfully");
 
+        let encode_timeline_semaphore = create_timeline_semaphore(&context)?;
+
         let mut encoder = Self {
             context,
             config: config.clone(),
@@ -602,6 +604,9 @@ impl H264Encoder {
             idr_pic_id: 0,
             slots,
             current_slot: 0,
+            encode_timeline_semaphore,
+            next_encode_timeline_value: 1,
+            last_encode_timeline_value: 0,
             dpb_images,
             dpb_image_memories,
             dpb_image_views,

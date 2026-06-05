@@ -543,6 +543,11 @@ impl AV1Encoder {
         );
 
         let gpu_start = std::time::Instant::now();
+        let wait_timeline = (self.last_encode_timeline_value > 0).then_some((
+            self.encode_timeline_semaphore,
+            self.last_encode_timeline_value,
+        ));
+        let signal_timeline_value = self.next_encode_timeline_value;
 
         unsafe {
             submit_encode_only(
@@ -550,9 +555,12 @@ impl AV1Encoder {
                 self.slots[self.current_slot].encode_command_buffer,
                 self.slots[self.current_slot].encode_fence,
                 encode_queue,
-                None,
+                wait_timeline,
+                Some((self.encode_timeline_semaphore, signal_timeline_value)),
             )?;
         }
+        self.last_encode_timeline_value = signal_timeline_value;
+        self.next_encode_timeline_value = signal_timeline_value + 1;
 
         debug!("Submitted encode (no wait): {:?}", gpu_start.elapsed());
 

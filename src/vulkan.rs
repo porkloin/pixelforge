@@ -453,6 +453,29 @@ impl VideoContext {
         let mut sync2_features =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
 
+        let mut supported_timeline_features =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut timeline_feature_query = vk::PhysicalDeviceFeatures2 {
+            p_next: (&mut supported_timeline_features
+                as *mut vk::PhysicalDeviceTimelineSemaphoreFeatures)
+                .cast(),
+            ..Default::default()
+        };
+        unsafe {
+            instance.get_physical_device_features2(physical_device, &mut timeline_feature_query);
+        }
+        if supported_timeline_features.timeline_semaphore == 0 {
+            return Err(PixelForgeError::NoSuitableDevice(
+                "Timeline semaphores are required for pipelined video encode synchronization"
+                    .to_string(),
+            ));
+        }
+
+        // Timeline semaphores are used to chain pipelined video encode submits
+        // without blocking the CPU on fences between frames.
+        let mut timeline_features =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+
         // Enable sampler YCbCr conversion feature (required for YUV image views with SAMPLED flag).
         let mut ycbcr_features = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
             .sampler_ycbcr_conversion(true);
@@ -481,8 +504,10 @@ impl VideoContext {
         ycbcr_features.p_next = (&mut ycbcr_2plane_444_features
             as *mut vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT)
             .cast();
-        sync2_features.p_next =
+        timeline_features.p_next =
             (&mut ycbcr_features as *mut vk::PhysicalDeviceSamplerYcbcrConversionFeatures).cast();
+        sync2_features.p_next =
+            (&mut timeline_features as *mut vk::PhysicalDeviceTimelineSemaphoreFeatures).cast();
 
         // Query descriptor buffer and buffer device address feature support.
         let mut desc_buf_features = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();

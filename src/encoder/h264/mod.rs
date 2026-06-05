@@ -92,6 +92,10 @@ pub struct H264Encoder {
     /// Per-frame encode slots. See encoder::h265 for invariants.
     pub(crate) slots: Vec<EncodeSlot>,
     pub(crate) current_slot: usize,
+    /// Timeline semaphore used to serialize encode submissions that share DPB state.
+    encode_timeline_semaphore: vk::Semaphore,
+    next_encode_timeline_value: u64,
+    last_encode_timeline_value: u64,
 
     /// DPB images (up to MAX_DPB_SLOTS for B-frame and long-term reference support).
     dpb_images: Vec<vk::Image>,
@@ -194,6 +198,7 @@ impl Drop for H264Encoder {
                 device.destroy_image(slot.input_image, None);
                 device.free_memory(slot.input_image_memory, None);
             }
+            device.destroy_semaphore(self.encode_timeline_semaphore, None);
 
             device.destroy_fence(self.upload_fence, None);
             device.destroy_command_pool(self.command_pool, None);

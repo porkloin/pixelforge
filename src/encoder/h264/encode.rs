@@ -620,6 +620,11 @@ impl H264Encoder {
         let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
+        let wait_timeline = (self.last_encode_timeline_value > 0).then_some((
+            self.encode_timeline_semaphore,
+            self.last_encode_timeline_value,
+        ));
+        let signal_timeline_value = self.next_encode_timeline_value;
 
         unsafe {
             submit_encode_only(
@@ -627,9 +632,12 @@ impl H264Encoder {
                 self.slots[self.current_slot].encode_command_buffer,
                 self.slots[self.current_slot].encode_fence,
                 encode_queue,
-                None,
+                wait_timeline,
+                Some((self.encode_timeline_semaphore, signal_timeline_value)),
             )?;
         }
+        self.last_encode_timeline_value = signal_timeline_value;
+        self.next_encode_timeline_value = signal_timeline_value + 1;
 
         // Mark DPB slot as active.
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;

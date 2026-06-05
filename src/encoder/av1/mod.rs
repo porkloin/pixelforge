@@ -87,6 +87,10 @@ pub struct AV1Encoder {
     /// Per-frame encode slots. See encoder::h265 for invariants.
     pub(crate) slots: Vec<EncodeSlot>,
     pub(crate) current_slot: usize,
+    /// Timeline semaphore used to serialize encode submissions that share DPB state.
+    encode_timeline_semaphore: vk::Semaphore,
+    next_encode_timeline_value: u64,
+    last_encode_timeline_value: u64,
 
     /// DPB images for reference frames.
     dpb_images: Vec<vk::Image>,
@@ -102,8 +106,6 @@ pub struct AV1Encoder {
     upload_command_pool: vk::CommandPool,
     upload_command_buffer: vk::CommandBuffer,
     upload_fence: vk::Fence,
-
-    // Optional semaphore to wait on before encoding (from color converter).
 
     // Cached AV1 sequence header OBU (retrieved from session parameters).
     header_data: Option<Vec<u8>>,
@@ -172,6 +174,7 @@ impl Drop for AV1Encoder {
                 device.destroy_image(slot.input_image, None);
                 device.free_memory(slot.input_image_memory, None);
             }
+            device.destroy_semaphore(self.encode_timeline_semaphore, None);
 
             device.destroy_fence(self.upload_fence, None);
             device.destroy_command_pool(self.command_pool, None);
