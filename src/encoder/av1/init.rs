@@ -112,6 +112,9 @@ impl Av1 {
                 config.dimensions.height,
                 av1_caps.coded_picture_alignment,
             ),
+            frame_size_override: av1_caps
+                .flags
+                .contains(vk::VideoEncodeAV1CapabilityFlagsKHR::FRAME_SIZE_OVERRIDE),
         };
         debug!(
             "AV1 coded picture alignment {}x{}: frames are coded at {}x{}",

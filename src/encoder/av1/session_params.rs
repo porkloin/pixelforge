@@ -19,9 +19,15 @@ impl Av1 {
     ) -> Result<vk::VideoSessionParametersKHR> {
         let config = &common.config;
         // The device may code a frame larger than the display size (see
-        // `coded_size`), so the sequence header allows that size.
-        let width = self.coded_size.width;
-        let height = self.coded_size.height;
+        // `coded_size`), so the sequence header allows that size. Without
+        // FRAME_SIZE_OVERRIDE it must be the coded extent pixelforge passes,
+        // the display size (VUID-vkCmdEncodeVideoKHR-flags-10323/10324); the
+        // device then applies its alignment to the sequence header itself.
+        let (width, height) = if self.frame_size_override {
+            (self.coded_size.width, self.coded_size.height)
+        } else {
+            (config.dimensions.width, config.dimensions.height)
+        };
 
         let frame_width_bits = 32 - (width - 1).leading_zeros();
         let frame_height_bits = 32 - (height - 1).leading_zeros();

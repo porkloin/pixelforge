@@ -56,20 +56,30 @@ pub(crate) struct Av1 {
     /// How many references shown before it a frame that predicts from both
     /// directions uses. It uses one shown after it.
     bidirectional_past_count: u32,
-    /// The frame size the device codes: the display size aligned up to
-    /// `codedPictureAlignment`. The sequence header must allow it.
+    /// The frame size the device codes (see [`coded_size`]). The sequence
+    /// header must allow it.
     coded_size: vk::Extent2D,
+    /// Whether the device has `FRAME_SIZE_OVERRIDE`: without it, the sequence
+    /// header's maximum frame size must be the coded extent pixelforge passes
+    /// (the display size), and the device applies its alignment itself.
+    frame_size_override: bool,
 }
 
 /// The frame size a device that codes pictures at `alignment` gives a frame
-/// of `width` x `height`. The Vulkan spec lets the implementation enlarge the
-/// coded frame to its alignment; the render size still crops to the display
-/// size. An alignment of zero is treated as the AV1 minimum of 8.
+/// of `width` x `height`, by the Vulkan spec's resolution override: AV1 codes
+/// in 8x8 blocks and crops the rest implicitly, so a size whose 8-aligned
+/// value meets the alignment is coded as it is (1366 stays 1366, 1082 stays
+/// 1082 at 16); otherwise the coded size is that value aligned up (1080 at 16
+/// is 1088).
 fn coded_size(width: u32, height: u32, alignment: vk::Extent2D) -> vk::Extent2D {
-    let align = |value: u32, unit: u32| value.div_ceil(unit.max(1)) * unit.max(1);
+    let coded = |value: u32, unit: u32| {
+        let blocks = value.div_ceil(8) * 8;
+        let aligned = blocks.div_ceil(unit.max(1)) * unit.max(1);
+        if aligned == blocks { value } else { aligned }
+    };
     vk::Extent2D {
-        width: align(width, alignment.width.max(8)),
-        height: align(height, alignment.height.max(8)),
+        width: coded(width, alignment.width),
+        height: coded(height, alignment.height),
     }
 }
 
@@ -269,6 +279,12 @@ mod tests {
         assert_eq!(size(320, 240, extent(64, 64)), (320, 256));
         assert_eq!(size(1920, 1080, extent(16, 16)), (1920, 1088));
         assert_eq!(size(1920, 1080, extent(0, 0)), (1920, 1080));
+        // AMD VCN4 (64x16), VCN5 (8x2), Intel (8x8).
+        assert_eq!(size(3440, 1440, extent(64, 16)), (3456, 1440));
+        assert_eq!(size(1920, 1080, extent(8, 2)), (1920, 1080));
+        // Sizes whose 8x8 blocks already meet the alignment are not padded.
+        assert_eq!(size(1366, 768, extent(8, 8)), (1366, 768));
+        assert_eq!(size(1920, 1082, extent(16, 16)), (1920, 1082));
     }
 
     #[test]
